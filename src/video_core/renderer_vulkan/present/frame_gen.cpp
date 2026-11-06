@@ -8,10 +8,12 @@
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
@@ -202,6 +204,25 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         shaders.emplace(device);
     }
 
+    // Both settings can change mid-game (status bar button): LSFG is unavailable only while it is
+    // the selected type and Lossless.dll's shaders didn't load.
+    const auto type = Settings::values.frame_gen_type.GetValue();
+    unavailable = type != Settings::FrameGenType::Fsr3 && !shaders->IsValid();
+    if (!Settings::values.frame_gen.GetValue()) {
+        reported = 0;
+        frames_without_storage = 0;
+    } else if (unavailable) {
+        state.store(shaders->IsDeviceSupported() ? VideoCore::FrameGenState::MissingLosslessDll
+                                                 : VideoCore::FrameGenState::UnsupportedGpu,
+                    std::memory_order_relaxed);
+        if ((reported & REPORTED_NO_LSFG) == 0) {
+            reported |= REPORTED_NO_LSFG;
+            LOG_WARNING(Render_Vulkan,
+                        "Frame generation is off: Lossless Scaling (LSFG) is selected but "
+                        "Lossless.dll was not loaded from the lossless folder. Pick the built-in "
+                        "type or add the DLL.");
+        }
+    }
     if (unavailable || !Settings::values.frame_gen.GetValue()) {
         if (chain || fsr3_chain) {
             scheduler.Finish();
@@ -212,20 +233,22 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         return;
     }
 
-    if (!shaders->IsValid() && Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3) {
-        unavailable = true;
-        state.store(shaders->IsDeviceSupported() ? VideoCore::FrameGenState::MissingLosslessDll
-                                                 : VideoCore::FrameGenState::UnsupportedGpu,
-                    std::memory_order_relaxed);
-        return;
-    }
-
     if (!frame->storage_view) {
         state.store(VideoCore::FrameGenState::UnsupportedSurface, std::memory_order_relaxed);
         warm_streak = 0;
+        // A frame gets its storage view at its next present; after that, none means the
+        // display image format can't be written by compute shaders on this GPU.
+        if (++frames_without_storage == 120 && (reported & REPORTED_NO_STORAGE) == 0) {
+            reported |= REPORTED_NO_STORAGE;
+            LOG_WARNING(Render_Vulkan,
+                        "Frame generation can't run: this GPU can't write the display image "
+                        "format {} from compute shaders",
+                        string_VkFormat(format));
+        }
         return;
     }
     state.store(VideoCore::FrameGenState::Running, std::memory_order_relaxed);
+    frames_without_storage = 0;
 
     peak_guest_extent.width = (std::max)(peak_guest_extent.width, guest_extent.width);
     peak_guest_extent.height = (std::max)(peak_guest_extent.height, guest_extent.height);
@@ -245,6 +268,12 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     warm_streak = warm ? warm_streak + 1 : 0;
     generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
     generated_frames.fetch_add(GeneratedFrameCount(), std::memory_order_relaxed);
+    if (generated && (reported & REPORTED_RUNNING) == 0) {
+        reported |= REPORTED_RUNNING;
+        LOG_INFO(Render_Vulkan, "Frame generation running: {} generated frame(s) per game frame ({})",
+                 plan.generations,
+                 type == Settings::FrameGenType::Fsr3 ? "built-in optical flow" : "LSFG");
+    }
 
     const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
 

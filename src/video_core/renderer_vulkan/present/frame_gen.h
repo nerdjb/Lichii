@@ -63,6 +63,11 @@ private:
     bool dumped{};
     std::atomic<VideoCore::FrameGenState> state{VideoCore::FrameGenState::Pending};
     std::atomic<u64> generated_frames{};
+    u32 frames_without_storage{};
+    u32 reported{}; ///< REPORTED_* log lines already written since frame generation was turned on
+    static constexpr u32 REPORTED_NO_LSFG = 1U << 0;
+    static constexpr u32 REPORTED_NO_STORAGE = 1U << 1;
+    static constexpr u32 REPORTED_RUNNING = 1U << 2;
 };
 
 } // namespace Vulkan
