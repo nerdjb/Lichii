@@ -1,11 +1,14 @@
 # AMD frame-generation patches
 
 These are the three commits from [chuppatricky/Lichii](https://github.com/chuppatricky/Lichii)
-(`chuppatricky-amd-testbuild-v14-source`) that are not in `zortos293/Lichii@nx2`:
+(`chuppatricky-amd-testbuild-v14-source`) that are not in `zortos293/Lichii@nx2`, plus one small
+prerequisite:
 
 1. `present: log when frame generation runs or why it can't`
 2. `frame_gen: space generated frames over the game frame's time`
 3. `frame_gen: find large motion in the built-in frame generation`
+4. `present: allow extra image usage flags for wrapped images` (the `extra_usage` parameter; the
+   large-motion rewrite needs it, and its original commit is already upstream without it)
 
 They are rebased onto upstream `nx2` commit `89440b29a9` and are the content of the branch commits
 with the same subjects. The `upstream-sync` workflow normally merges upstream into

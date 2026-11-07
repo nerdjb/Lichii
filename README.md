@@ -36,7 +36,8 @@ This is [nerdjb/Lichii](https://github.com/nerdjb/Lichii), a fork of
 The default branch is `nx2-amd-framegen`. The `upstream-sync` workflow merges
 `zortos293/Lichii@nx2` every day, pushes the result, and starts `release-binaries`, so this fork's
 releases follow upstream automatically. Downloads are on
-[this fork's releases page](https://github.com/nerdjb/Lichii/releases).
+[this fork's releases page](https://github.com/nerdjb/Lichii/releases), and the built-in updater
+follows those releases so it will not replace this build with an upstream one.
 
 ## Downloads and setup
 
