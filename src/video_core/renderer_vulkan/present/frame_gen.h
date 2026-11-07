@@ -31,6 +31,11 @@ public:
 
     [[nodiscard]] size_t GeneratedFrameCount() const;
 
+    /// The smoothed time between game frames, in seconds (0 until measured).
+    [[nodiscard]] f32 FrameInterval() const {
+        return pacer.FrameInterval();
+    }
+
     void GenerateInto(const Device& device, Frame* destination, size_t generation);
 
     [[nodiscard]] VideoCore::FrameGenStatus CurrentStatus() const {
