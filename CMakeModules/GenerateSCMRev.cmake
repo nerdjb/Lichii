@@ -37,11 +37,14 @@ set(GIT_DESC ${BUILD_VERSION})
 
 # Generate cpp with Git revision from template
 
-set(BUILD_AUTO_UPDATE_STABLE_REPO "zortos293/Lichii")
+# This fork publishes its own builds. Point the updater at them, otherwise it would offer an
+# upstream release and replace the AMD frame-generation binary.
+set(LICHII_UPDATE_REPO "nerdjb/Lichii")
+set(BUILD_AUTO_UPDATE_STABLE_REPO "${LICHII_UPDATE_REPO}")
 set(BUILD_AUTO_UPDATE_STABLE_API "api.github.com")
-set(BUILD_AUTO_UPDATE_API_PATH "/repos/zortos293/Lichii/releases?per_page=100")
+set(BUILD_AUTO_UPDATE_API_PATH "/repos/${LICHII_UPDATE_REPO}/releases?per_page=100")
 set(BUILD_AUTO_UPDATE_WEBSITE "https://github.com")
-set(BUILD_AUTO_UPDATE_REPO "zortos293/Lichii")
+set(BUILD_AUTO_UPDATE_REPO "${LICHII_UPDATE_REPO}")
 if (NIGHTLY_BUILD)
     set(REPO_NAME "Lichii Nightly")
 else()

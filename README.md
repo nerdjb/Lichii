@@ -40,7 +40,7 @@ releases follow upstream automatically. Downloads are on
 
 ## Downloads and setup
 
-Published builds belong on this fork's [releases page](https://github.com/zortos293/Eglantine/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.
+Published builds belong on this fork's [releases page](https://github.com/nerdjb/Lichii/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.
 
 On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
 
