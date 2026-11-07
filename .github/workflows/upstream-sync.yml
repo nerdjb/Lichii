@@ -1,0 +1,110 @@
+name: upstream-sync
+
+# Keep this fork's AMD frame-generation branch current with zortos293/Lichii's nx2 branch.
+# When upstream moves, merge it into nx2-amd-framegen, push, and ask release-binaries to build
+# and publish a fresh release. If the merge conflicts, open an issue instead of guessing.
+
+on:
+  schedule:
+    # Daily at 04:17 UTC. GitHub may delay scheduled runs at busy times.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream nx2 and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the AMD frame-generation branch
+        uses: actions/checkout@v5
+        with:
+          ref: nx2-amd-framegen
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "Lichii AMD frame-gen sync"
+          git config user.email "lichii-amd-framegen@users.noreply.github.com"
+
+      - name: Fetch upstream nx2
+        run: |
+          git remote add upstream https://github.com/zortos293/Lichii.git 2>/dev/null || true
+          git fetch --no-tags upstream nx2
+
+      - name: Merge upstream
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor upstream/nx2 HEAD; then
+            echo "Already contains upstream/nx2."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge --no-edit upstream/nx2; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Merged upstream/nx2 with no conflicts."
+            exit 0
+          fi
+
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+          {
+            echo "## Upstream sync stopped"
+            echo
+            echo "Merging \`zortos293/Lichii@nx2\` (\`$(git rev-parse --short upstream/nx2)\`) into"
+            echo "\`nx2-amd-framegen\` had conflicts. The branch was left unchanged."
+            echo
+            echo "Conflicting files:"
+            for f in "${conflicts[@]}"; do echo "- \`$f\`"; done
+            echo
+            echo "Resolve locally with:"
+            echo '```sh'
+            echo "git fetch upstream nx2 && git merge upstream/nx2"
+            echo "# resolve, then: git add <files> && git commit"
+            echo '```'
+          } > /tmp/sync-conflict.md
+          cat /tmp/sync-conflict.md
+          git merge --abort || true
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          echo "conflict=true" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Report merge conflicts
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="Upstream sync failed: resolve nx2 merge conflicts"
+          existing=$(gh issue list --state open --search "Upstream sync failed in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file /tmp/sync-conflict.md
+          else
+            gh issue create --title "$title" --body-file /tmp/sync-conflict.md
+          fi
+
+      - name: Push the merge
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:nx2-amd-framegen
+
+      - name: Start a release build
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release-binaries.yml --ref nx2-amd-framegen -f publish_release=true
+
+      - name: Fail when the merge conflicted
+        if: steps.merge.outputs.conflict == 'true'
+        run: exit 1

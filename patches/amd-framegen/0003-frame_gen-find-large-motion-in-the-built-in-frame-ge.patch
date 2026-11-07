@@ -1,0 +1,1594 @@
+From 4be31e083015e449db17154533b875f456426557 Mon Sep 17 00:00:00 2001
+From: chuppatricky <74110004+chuppatricky@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:05:21 -0600
+Subject: [PATCH 3/4] frame_gen: find large motion in the built-in frame
+ generation
+
+The built-in ("FSR3") frame generation searched for motion only 3 texels
+around each pixel of a half-size frame, about 6 screen pixels. Turning the
+camera in Ocarina of Time moves the picture 50-100 pixels per game frame at
+1440p, so the search found nothing and every generated frame was the two game
+frames cross-faded: a double image on every other frame while panning, seen
+as a subtle flicker, and no smoother motion. A user's recording showed the
+generated frames as near-exact 50/50 blends of their neighbours; rebuilding
+real game frames from the frames around them scored the same as a plain
+blend.
+
+Motion is now found on a brightness pyramid of the presented frame at 1/8,
+1/16 and 1/32 size: a full search of +-6 texels at 1/32 (+-192 pixels),
+refined at 1/16 and 1/8 from the median coarse vectors, then a 3x3 median.
+Each generated pixel tries the field's vector, the vectors of the 3x3 field
+texels around it and zero, and keeps the one whose previous- and current-frame
+samples agree best, so Link and the HUD, which hold still on screen, don't
+smear into a panning background. On consecutive game frames from Kokiri
+Forest the rebuilt middle frame's error dropped from 0.066 (blend) to 0.057;
+in game the generated frames are halfway pictures, not cross-fades. Same
+frame rate (36-37 FPS game, 70-73 shown, RX 7900 GRE, 1440p handheld).
+
+EDEN_NX2_FG_DUMP_DIR=<folder> plus <folder>/fgdump.now saves the next 6 game
+frames' generated frames with the game frames around them, for debugging.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit cdc0101da467b9b0d301e1cc2a3ca9c2e11affc6)
+---
+ src/video_core/host_shaders/CMakeLists.txt    |   5 +-
+ .../host_shaders/fg_flow_median.comp          |  46 ++
+ .../host_shaders/fg_flow_refine.comp          |  98 +++
+ .../host_shaders/fg_flow_search.comp          |  59 ++
+ src/video_core/host_shaders/fg_luma_down.comp |  37 ++
+ .../fsr3_frame_interpolation.comp             | 133 ++--
+ .../host_shaders/fsr3_optical_flow.comp       | 112 ----
+ .../renderer_vulkan/present/frame_gen.cpp     |  49 +-
+ .../renderer_vulkan/present/frame_gen.h       |   3 +
+ .../present/fsr3_frame_gen.cpp                | 595 +++++++++++-------
+ .../renderer_vulkan/present/fsr3_frame_gen.h  | 115 ++--
+ 11 files changed, 767 insertions(+), 485 deletions(-)
+ create mode 100644 src/video_core/host_shaders/fg_flow_median.comp
+ create mode 100644 src/video_core/host_shaders/fg_flow_refine.comp
+ create mode 100644 src/video_core/host_shaders/fg_flow_search.comp
+ create mode 100644 src/video_core/host_shaders/fg_luma_down.comp
+ delete mode 100644 src/video_core/host_shaders/fsr3_optical_flow.comp
+
+diff --git a/src/video_core/host_shaders/CMakeLists.txt b/src/video_core/host_shaders/CMakeLists.txt
+index 7cff85d663..4b0d44e1dd 100644
+--- a/src/video_core/host_shaders/CMakeLists.txt
++++ b/src/video_core/host_shaders/CMakeLists.txt
+@@ -98,7 +98,10 @@ set(SHADER_FILES
+     ${CMAKE_CURRENT_SOURCE_DIR}/sgsr1_shader.vert
+     ${CMAKE_CURRENT_SOURCE_DIR}/sgsr1_shader_mobile.frag
+     ${CMAKE_CURRENT_SOURCE_DIR}/sgsr1_shader_mobile_edge_direction.frag
+-    ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_optical_flow.comp
++    ${CMAKE_CURRENT_SOURCE_DIR}/fg_flow_median.comp
++    ${CMAKE_CURRENT_SOURCE_DIR}/fg_flow_refine.comp
++    ${CMAKE_CURRENT_SOURCE_DIR}/fg_flow_search.comp
++    ${CMAKE_CURRENT_SOURCE_DIR}/fg_luma_down.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_frame_interpolation.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/dlss_network_probe.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_camera_motion.comp
+diff --git a/src/video_core/host_shaders/fg_flow_median.comp b/src/video_core/host_shaders/fg_flow_median.comp
+new file mode 100644
+index 0000000000..aeec90b018
+--- /dev/null
++++ b/src/video_core/host_shaders/fg_flow_median.comp
+@@ -0,0 +1,46 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Frame generation: 3x3 median of the finest motion field, per component, to drop stray vectors.
++
++#version 460 core
++
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++
++layout(binding = 0) uniform sampler2D Vectors;
++layout(binding = 1, rg16f) uniform writeonly image2D OutVectors;
++
++layout(push_constant) uniform PushConstants {
++    ivec2 size;
++};
++
++float Median9(float v[9]) {
++    for (int i = 1; i < 9; ++i) {
++        const float key = v[i];
++        int j = i - 1;
++        while (j >= 0 && v[j] > key) {
++            v[j + 1] = v[j];
++            --j;
++        }
++        v[j + 1] = key;
++    }
++    return v[4];
++}
++
++void main() {
++    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(p, size))) {
++        return;
++    }
++    const ivec2 last = size - 1;
++    float xs[9];
++    float ys[9];
++    for (int y = -1; y <= 1; ++y) {
++        for (int x = -1; x <= 1; ++x) {
++            const vec2 v = texelFetch(Vectors, clamp(p + ivec2(x, y), ivec2(0), last), 0).xy;
++            xs[(y + 1) * 3 + x + 1] = v.x;
++            ys[(y + 1) * 3 + x + 1] = v.y;
++        }
++    }
++    imageStore(OutVectors, p, vec4(Median9(xs), Median9(ys), 0.0, 0.0));
++}
+diff --git a/src/video_core/host_shaders/fg_flow_refine.comp b/src/video_core/host_shaders/fg_flow_refine.comp
+new file mode 100644
+index 0000000000..8220d9e2a1
+--- /dev/null
++++ b/src/video_core/host_shaders/fg_flow_refine.comp
+@@ -0,0 +1,98 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Frame generation: refines the motion of the next coarser level at this level's resolution. The
++// candidates are the 3x3-median coarse vectors under the texel and its four neighbours (scaled to
++// this level), and zero, each tried with offsets of -1..1 texel; the cost is the same 5x5 window
++// brightness difference and length penalty as the full search.
++
++#version 460 core
++
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++
++layout(binding = 0) uniform sampler2D CurrentLuma;
++layout(binding = 1) uniform sampler2D PreviousLuma;
++layout(binding = 2) uniform sampler2D CoarseVectors;
++layout(binding = 3, rg16f) uniform writeonly image2D OutVectors;
++
++layout(push_constant) uniform PushConstants {
++    ivec2 size;
++    ivec2 coarse_size;
++    int ratio;
++    float lambda;
++};
++
++const int WIN = 2;
++const int TAPS = (2 * WIN + 1) * (2 * WIN + 1);
++
++float Median9(float v[9]) {
++    for (int i = 1; i < 9; ++i) {
++        const float key = v[i];
++        int j = i - 1;
++        while (j >= 0 && v[j] > key) {
++            v[j + 1] = v[j];
++            --j;
++        }
++        v[j + 1] = key;
++    }
++    return v[4];
++}
++
++ivec2 CoarseMedian(ivec2 c) {
++    const ivec2 last = coarse_size - 1;
++    c = clamp(c, ivec2(0), last);
++    float xs[9];
++    float ys[9];
++    for (int y = -1; y <= 1; ++y) {
++        for (int x = -1; x <= 1; ++x) {
++            const vec2 v = texelFetch(CoarseVectors, clamp(c + ivec2(x, y), ivec2(0), last), 0).xy;
++            xs[(y + 1) * 3 + x + 1] = v.x;
++            ys[(y + 1) * 3 + x + 1] = v.y;
++        }
++    }
++    return ivec2(round(vec2(Median9(xs), Median9(ys))));
++}
++
++void main() {
++    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(p, size))) {
++        return;
++    }
++    const ivec2 last = size - 1;
++    float current[TAPS];
++    for (int y = -WIN; y <= WIN; ++y) {
++        for (int x = -WIN; x <= WIN; ++x) {
++            const ivec2 q = clamp(p + ivec2(x, y), ivec2(0), last);
++            current[(y + WIN) * (2 * WIN + 1) + x + WIN] = texelFetch(CurrentLuma, q, 0).r;
++        }
++    }
++    const ivec2 coarse = p / ratio;
++    const ivec2 bases[6] = ivec2[](CoarseMedian(coarse) * ratio,
++                                   CoarseMedian(coarse + ivec2(0, -1)) * ratio,
++                                   CoarseMedian(coarse + ivec2(0, 1)) * ratio,
++                                   CoarseMedian(coarse + ivec2(-1, 0)) * ratio,
++                                   CoarseMedian(coarse + ivec2(1, 0)) * ratio, ivec2(0));
++    float best = 1e30;
++    ivec2 best_vector = ivec2(0);
++    for (int b = 0; b < 6; ++b) {
++        for (int dy = -1; dy <= 1; ++dy) {
++            for (int dx = -1; dx <= 1; ++dx) {
++                const ivec2 v = bases[b] + ivec2(dx, dy);
++                float cost = lambda * float(TAPS) * length(vec2(v));
++                for (int y = -WIN; y <= WIN; ++y) {
++                    for (int x = -WIN; x <= WIN; ++x) {
++                        const ivec2 q = clamp(p + ivec2(x, y), ivec2(0), last);
++                        const float previous =
++                            texelFetch(PreviousLuma, clamp(q + v, ivec2(0), last), 0).r;
++                        cost += abs(current[(y + WIN) * (2 * WIN + 1) + x + WIN] - previous);
++                    }
++                }
++                if (cost < best) {
++                    best = cost;
++                    best_vector = v;
++                }
++            }
++        }
++    }
++    imageStore(OutVectors, p, vec4(vec2(best_vector), 0.0, 0.0));
++}
+diff --git a/src/video_core/host_shaders/fg_flow_search.comp b/src/video_core/host_shaders/fg_flow_search.comp
+new file mode 100644
+index 0000000000..4efe949361
+--- /dev/null
++++ b/src/video_core/host_shaders/fg_flow_search.comp
+@@ -0,0 +1,59 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Frame generation: full motion search on the coarsest brightness level. For each texel, every
++// offset within `radius` texels is tried; the cost is the summed brightness difference over a 5x5
++// window plus a small penalty on the offset's length, so flat areas keep zero motion. The result is
++// the offset from the texel to where its content was in the previous frame, in texels.
++
++#version 460 core
++
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++
++layout(binding = 0) uniform sampler2D CurrentLuma;
++layout(binding = 1) uniform sampler2D PreviousLuma;
++layout(binding = 2, rg16f) uniform writeonly image2D OutVectors;
++
++layout(push_constant) uniform PushConstants {
++    ivec2 size;
++    int radius;
++    float lambda;
++};
++
++const int WIN = 2;
++const int TAPS = (2 * WIN + 1) * (2 * WIN + 1);
++
++void main() {
++    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(p, size))) {
++        return;
++    }
++    const ivec2 last = size - 1;
++    float current[TAPS];
++    for (int y = -WIN; y <= WIN; ++y) {
++        for (int x = -WIN; x <= WIN; ++x) {
++            const ivec2 q = clamp(p + ivec2(x, y), ivec2(0), last);
++            current[(y + WIN) * (2 * WIN + 1) + x + WIN] = texelFetch(CurrentLuma, q, 0).r;
++        }
++    }
++    float best = 1e30;
++    ivec2 best_vector = ivec2(0);
++    for (int vy = -radius; vy <= radius; ++vy) {
++        for (int vx = -radius; vx <= radius; ++vx) {
++            const ivec2 v = ivec2(vx, vy);
++            float cost = lambda * float(TAPS) * length(vec2(v));
++            for (int y = -WIN; y <= WIN; ++y) {
++                for (int x = -WIN; x <= WIN; ++x) {
++                    const ivec2 q = clamp(p + ivec2(x, y), ivec2(0), last);
++                    const float previous = texelFetch(PreviousLuma, clamp(q + v, ivec2(0), last), 0).r;
++                    cost += abs(current[(y + WIN) * (2 * WIN + 1) + x + WIN] - previous);
++                }
++            }
++            if (cost < best) {
++                best = cost;
++                best_vector = v;
++            }
++        }
++    }
++    imageStore(OutVectors, p, vec4(vec2(best_vector), 0.0, 0.0));
++}
+diff --git a/src/video_core/host_shaders/fg_luma_down.comp b/src/video_core/host_shaders/fg_luma_down.comp
+new file mode 100644
+index 0000000000..aa29f270d2
+--- /dev/null
++++ b/src/video_core/host_shaders/fg_luma_down.comp
+@@ -0,0 +1,37 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Frame generation: one level of the brightness pyramid the motion search runs on. Each destination
++// texel is the mean of a factor x factor block of source texels (factor even), read as bilinear taps
++// that fall between 2x2 source texels; from the colour frame it stores the block's luma.
++
++#version 460 core
++
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++
++layout(binding = 0) uniform sampler2D Source;
++layout(binding = 1, r16f) uniform writeonly image2D Destination;
++
++layout(push_constant) uniform PushConstants {
++    ivec2 dst_size;
++    vec2 inv_src_size;
++    int factor;
++    int from_rgb;
++};
++
++void main() {
++    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(p, dst_size))) {
++        return;
++    }
++    const int taps = factor / 2;
++    float sum = 0.0;
++    for (int y = 0; y < taps; ++y) {
++        for (int x = 0; x < taps; ++x) {
++            const vec2 pos = vec2(p * factor + ivec2(2 * x + 1, 2 * y + 1)) * inv_src_size;
++            const vec4 color = texture(Source, pos);
++            sum += from_rgb != 0 ? dot(color.rgb, vec3(0.299, 0.587, 0.114)) : color.r;
++        }
++    }
++    imageStore(Destination, p, vec4(sum / float(taps * taps)));
++}
+diff --git a/src/video_core/host_shaders/fsr3_frame_interpolation.comp b/src/video_core/host_shaders/fsr3_frame_interpolation.comp
+index 8c50928cc5..96d36bc11d 100644
+--- a/src/video_core/host_shaders/fsr3_frame_interpolation.comp
++++ b/src/video_core/host_shaders/fsr3_frame_interpolation.comp
+@@ -1,6 +1,17 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Frame generation: builds the frame at blend_factor between the previous and the current game
++// frame. Each pixel tries several motion vectors: the field's bilinear value (slightly preferred),
++// the vectors of the 3x3 field texels around it, and zero. For each it reads the previous frame
++// where the content was and the current frame where it went, and keeps the vector whose two
++// samples agree best. Picking per pixel keeps objects that hold still on screen (Link, the HUD)
++// from smearing into a moving background and the other way round; blending the samples of the
++// winning vector moves the picture instead of cross-fading it.
++
+ #version 460 core
+ 
+-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+ 
+ layout(binding = 0) uniform sampler2D CurrentFrame;
+ layout(binding = 1) uniform sampler2D PreviousFrame;
+@@ -10,97 +21,55 @@ layout(binding = 3, rgba8) uniform writeonly image2D OutGeneratedFrame;
+ layout(push_constant) uniform PushConstants {
+     vec2 inv_render_size;
+     vec2 render_size;
+-    float blend_factor; // timestamp between 0.0 and 1.0
+-    float flow_scale;
++    float blend_factor;
++    float texel_pixels; // presented pixels per motion field texel
+ };
+ 
+-// ΓöÇΓöÇ Optimized 3├ù3 motion vector median using textureGather ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+-// textureGather fetches a 2├ù2 quad per call, so we only need 4 calls
+-// to cover a 3├ù3 neighbourhood (vs 9 individual texture() calls).
+-// We extract the median of X and Y components independently.
+-void insertionSort5(inout float a[5]) {
+-    for (int i = 1; i < 5; i++) {
+-        float key = a[i];
+-        int j = i - 1;
+-        while (j >= 0 && a[j] > key) {
+-            a[j + 1] = a[j];
+-            j--;
+-        }
+-        a[j + 1] = key;
+-    }
+-}
+-
+-vec2 sampleMotionMedian(vec2 uv) {
+-    vec2 texel = 1.0 / vec2(textureSize(MotionVectors, 0));
+-
+-    // textureGather returns 2├ù2 quads: (x-0.5, y-0.5) to (x+0.5, y+0.5)
+-    // We use 4 gathers offset to cover the 3├ù3 region
+-    // Gather component 0 = R (motion X), component 1 = G (motion Y)
+-    vec4 gx0 = textureGather(MotionVectors, uv + vec2(-0.5, -0.5) * texel, 0); // TL quad
+-    vec4 gx1 = textureGather(MotionVectors, uv + vec2( 0.5, -0.5) * texel, 0); // TR quad
+-    vec4 gx2 = textureGather(MotionVectors, uv + vec2(-0.5,  0.5) * texel, 0); // BL quad
+-    vec4 gx3 = textureGather(MotionVectors, uv + vec2( 0.5,  0.5) * texel, 0); // BR quad
+-
+-    vec4 gy0 = textureGather(MotionVectors, uv + vec2(-0.5, -0.5) * texel, 1);
+-    vec4 gy1 = textureGather(MotionVectors, uv + vec2( 0.5, -0.5) * texel, 1);
+-    vec4 gy2 = textureGather(MotionVectors, uv + vec2(-0.5,  0.5) * texel, 1);
+-    vec4 gy3 = textureGather(MotionVectors, uv + vec2( 0.5,  0.5) * texel, 1);
++const float BILINEAR_PREFERENCE = 0.02;
+ 
+-    // Extract 9 unique samples from overlapping 2├ù2 quads
+-    // gatherN.w=TL, .z=TR, .x=BL, .y=BR of each quad
+-    // 3├ù3 grid: row0=[gx0.w, gx0.z/gx1.w, gx1.z]
+-    //           row1=[gx0.x/gx2.w, center, gx1.y/gx3.z]
+-    //           row2=[gx2.x, gx2.y/gx3.x, gx3.y]
+-    float xs[9] = float[](gx0.w, gx1.w, gx1.z, gx0.x, texture(MotionVectors, uv).x, gx1.y, gx2.x, gx3.x, gx3.y);
+-    float ys[9] = float[](gy0.w, gy1.w, gy1.z, gy0.x, texture(MotionVectors, uv).y, gy1.y, gy2.x, gy3.x, gy3.y);
++vec2 g_uv;
++float g_best;
++vec4 g_color;
+ 
+-    // Partial sort: only need to find element [4] (median)
+-    // Use two passes of 5-element insertion sort on the lower half
+-    float xlo[5] = float[](xs[0], xs[1], xs[2], xs[3], xs[4]);
+-    float ylo[5] = float[](ys[0], ys[1], ys[2], ys[3], ys[4]);
+-    insertionSort5(xlo);
+-    insertionSort5(ylo);
++vec4 SampleClamped(sampler2D image, vec2 uv) {
++    // The sampler clamps to a black border: stay half a pixel inside the frame.
++    return texture(image, clamp(uv, 0.5 * inv_render_size, 1.0 - 0.5 * inv_render_size));
++}
+ 
+-    // Insert remaining 4 elements, keeping only the 5 smallest
+-    for (int i = 5; i < 9; i++) {
+-        if (xs[i] < xlo[4]) { xlo[4] = xs[i]; insertionSort5(xlo); }
+-        if (ys[i] < ylo[4]) { ylo[4] = ys[i]; insertionSort5(ylo); }
++void Try(vec2 field_vector, float preference) {
++    // Field vectors are in field texels, from a current-frame position to where it was before.
++    const vec2 motion = field_vector * texel_pixels * inv_render_size;
++    const vec4 previous = SampleClamped(PreviousFrame, g_uv + motion * blend_factor);
++    const vec4 current = SampleClamped(CurrentFrame, g_uv - motion * (1.0 - blend_factor));
++    const float difference = dot(abs(previous.rgb - current.rgb), vec3(1.0 / 3.0)) - preference;
++    if (difference < g_best) {
++        g_best = difference;
++        g_color = mix(previous, current, blend_factor);
+     }
+-
+-    return vec2(xlo[4], ylo[4]);
+ }
+ 
+ void main() {
+-    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+-    if (pixel_coord.x >= int(render_size.x) || pixel_coord.y >= int(render_size.y)) {
++    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (p.x >= int(render_size.x) || p.y >= int(render_size.y)) {
+         return;
+     }
++    const vec2 pixel = vec2(p) + 0.5;
++    g_uv = pixel * inv_render_size;
++    g_best = 1e30;
++    g_color = vec4(0.0);
++
++    const ivec2 field_size = textureSize(MotionVectors, 0);
++    const vec2 field_pos = clamp(pixel / texel_pixels, vec2(0.5), vec2(field_size) - 0.5);
++    Try(texture(MotionVectors, field_pos / vec2(field_size)).xy, BILINEAR_PREFERENCE);
++
++    const ivec2 texel = clamp(ivec2(pixel / texel_pixels), ivec2(0), field_size - 1);
++    for (int y = -1; y <= 1; ++y) {
++        for (int x = -1; x <= 1; ++x) {
++            const ivec2 q = clamp(texel + ivec2(x, y), ivec2(0), field_size - 1);
++            Try(texelFetch(MotionVectors, q, 0).xy, 0.0);
++        }
++    }
++    Try(vec2(0.0), 0.0);
+ 
+-    vec2 uv = (vec2(pixel_coord) + 0.5) * inv_render_size;
+-
+-    // Median-filtered motion vector (reduces outlier jitter)
+-    vec2 motion = sampleMotionMedian(uv) / vec2(textureSize(MotionVectors, 0));
+-
+-    // Forward and backward warped coordinates
+-    vec2 forward_uv  = clamp(uv + motion * blend_factor,         0.0, 1.0);
+-    vec2 backward_uv = clamp(uv - motion * (1.0 - blend_factor), 0.0, 1.0);
+-
+-    vec4 forward_color  = texture(PreviousFrame, forward_uv);
+-    vec4 backward_color = texture(CurrentFrame,  backward_uv);
+-
+-    // Colour-difference occlusion
+-    vec3 color_diff = abs(forward_color.rgb - backward_color.rgb);
+-    float occlusion = clamp(dot(color_diff, vec3(0.333)) * 2.0, 0.0, 1.0);
+-
+-    // Smooth bilateral interpolation ΓÇö bias toward centre on occlusion
+-    float alpha = mix(blend_factor, 0.5, occlusion * 0.4);
+-    vec4 interpolated = mix(forward_color, backward_color, alpha);
+-
+-    // ΓöÇΓöÇ Anti-flicker: blend with un-warped centre pixel ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+-    float motion_magnitude = length(motion * render_size);
+-    float direct_weight = exp(-motion_magnitude * 0.5);
+-    vec4 center_color = mix(texture(PreviousFrame, uv), texture(CurrentFrame, uv), blend_factor);
+-    interpolated = mix(interpolated, center_color, direct_weight * 0.3);
+-
+-    imageStore(OutGeneratedFrame, pixel_coord, interpolated);
++    imageStore(OutGeneratedFrame, p, g_color);
+ }
+diff --git a/src/video_core/host_shaders/fsr3_optical_flow.comp b/src/video_core/host_shaders/fsr3_optical_flow.comp
+deleted file mode 100644
+index b0e04600cb..0000000000
+--- a/src/video_core/host_shaders/fsr3_optical_flow.comp
++++ /dev/null
+@@ -1,112 +0,0 @@
+-#version 460 core
+-
+-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+-
+-layout(binding = 0) uniform sampler2D CurrentFrame;
+-layout(binding = 1) uniform sampler2D PreviousFrame;
+-layout(binding = 2, rg16f) uniform writeonly image2D OutMotionVectors;
+-
+-layout(push_constant) uniform PushConstants {
+-    vec2 inv_render_size;
+-    vec2 render_size;
+-    float search_radius;
+-    float block_size;
+-};
+-
+-// ΓöÇΓöÇ Shared memory tile cache ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+-const uint TILE = 16u;
+-const uint BORDER = 2u;
+-const uint PADDED = TILE + 2u * BORDER; // 20
+-shared float s_curr_luma[PADDED * PADDED];
+-
+-float rgb2luma(vec3 c) {
+-    return dot(c, vec3(0.299, 0.587, 0.114));
+-}
+-
+-void loadTile(ivec2 tile_origin) {
+-    uint thread_id = gl_LocalInvocationID.y * TILE + gl_LocalInvocationID.x;
+-    for (uint i = thread_id; i < PADDED * PADDED; i += TILE * TILE) {
+-        uint lx = i % PADDED;
+-        uint ly = i / PADDED;
+-        ivec2 coord = tile_origin + ivec2(lx, ly) - ivec2(BORDER);
+-        vec2 uv = (vec2(coord) + 0.5) * inv_render_size;
+-        s_curr_luma[i] = rgb2luma(texture(CurrentFrame, uv).rgb);
+-    }
+-    barrier();
+-}
+-
+-float getCachedLuma(ivec2 local_coord) {
+-    ivec2 padded = local_coord + ivec2(BORDER);
+-    return s_curr_luma[padded.y * PADDED + padded.x];
+-}
+-
+-void main() {
+-    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+-
+-    ivec2 tile_origin = ivec2(gl_WorkGroupID.xy) * ivec2(TILE);
+-    loadTile(tile_origin);
+-
+-    if (pixel_coord.x >= int(render_size.x) || pixel_coord.y >= int(render_size.y)) {
+-        return;
+-    }
+-
+-    vec2 uv = (vec2(pixel_coord) + 0.5) * inv_render_size;
+-    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+-    float curr_luma = getCachedLuma(local);
+-
+-    float center_diff = abs(curr_luma - rgb2luma(texture(PreviousFrame, uv).rgb));
+-
+-    // Early-out only for truly identical pixels (very tight threshold)
+-    if (center_diff < 0.002) {
+-        imageStore(OutMotionVectors, pixel_coord, vec4(0.0, 0.0, 0.0, 0.0));
+-        return;
+-    }
+-
+-    vec2 best_motion = vec2(0.0);
+-    float min_diff = center_diff;
+-
+-    // Large diamond (radius 2)
+-    const vec2 diamond_large[4] = vec2[](
+-        vec2(0.0, -2.0),
+-        vec2(-2.0, 0.0), vec2(2.0, 0.0),
+-        vec2(0.0, 2.0)
+-    );
+-
+-    for (int i = 0; i < 4; ++i) {
+-        vec2 offset_uv = uv + diamond_large[i] * inv_render_size;
+-        float luma = rgb2luma(texture(PreviousFrame, offset_uv).rgb);
+-        float d = abs(curr_luma - luma) + 0.04 * length(diamond_large[i]);
+-        if (d < min_diff) {
+-            min_diff = d;
+-            best_motion = diamond_large[i];
+-        }
+-    }
+-
+-    // Small refinement diamond (radius 1)
+-    const vec2 diamond_small[4] = vec2[](
+-        vec2(0.0, -1.0),
+-        vec2(-1.0, 0.0), vec2(1.0, 0.0),
+-        vec2(0.0, 1.0)
+-    );
+-
+-    vec2 center = best_motion;
+-    for (int i = 0; i < 4; ++i) {
+-        vec2 cand = center + diamond_small[i];
+-        vec2 offset_uv = uv + cand * inv_render_size;
+-        float luma = rgb2luma(texture(PreviousFrame, offset_uv).rgb);
+-        float d = abs(curr_luma - luma) + 0.04 * length(cand);
+-        if (d < min_diff) {
+-            min_diff = d;
+-            best_motion = cand;
+-        }
+-    }
+-
+-    // ΓöÇΓöÇ Dampen very small motions to prevent micro-jitter ΓöÇΓöÇ
+-    // Motions below ~0.5 pixels are likely noise, not real movement
+-    float motion_len = length(best_motion);
+-    if (motion_len < 0.5) {
+-        best_motion *= motion_len * 2.0; // smooth fade to zero
+-    }
+-
+-    imageStore(OutMotionVectors, pixel_coord, vec4(best_motion, 0.0, 0.0));
+-}
+diff --git a/src/video_core/renderer_vulkan/present/frame_gen.cpp b/src/video_core/renderer_vulkan/present/frame_gen.cpp
+index f2106a75bd..141cd08540 100644
+--- a/src/video_core/renderer_vulkan/present/frame_gen.cpp
++++ b/src/video_core/renderer_vulkan/present/frame_gen.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <filesystem>
+ #include <string>
+ #include <vector>
+ 
+@@ -321,8 +323,8 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
+         const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, built_extent);
+ 
+         scheduler.RequestOutsideRenderPassOperationContext();
+-        fsr3_chain->Generate(device, scheduler, *destination->image, *destination->storage_view,
+-                             blend, flow_scale);
++        fsr3_chain->Generate(device, scheduler, *destination->storage_view, blend, flow_scale);
++        DumpGeneratedFrame(destination, generation);
+     } else if (chain) {
+         chain->SetTarget(device, last_generations, generation, destination->index,
+                          *destination->storage_view);
+@@ -358,6 +360,49 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
+     generated = false;
+ }
+ 
++// Debug: with EDEN_NX2_FG_DUMP_DIR=<folder>, creating <folder>/fgdump.now saves the built-in frame
++// generation's frames for the next 6 game frames there as PPM images: for each, the older game
++// frame (a), the generated frames (b, in order) and the newer game frame (c).
++void FrameGen::DumpGeneratedFrame(Frame* destination, size_t generation) {
++    static const char* const dump_dir = std::getenv("EDEN_NX2_FG_DUMP_DIR");
++    if (dump_dir == nullptr || !fsr3_chain) {
++        return;
++    }
++    const std::filesystem::path directory{dump_dir};
++    if (generation == 0 && fsr3_dumps_left == 0) {
++        std::error_code ec;
++        if (std::filesystem::remove(directory / "fgdump.now", ec)) {
++            fsr3_dumps_left = 6;
++        }
++    }
++    if (fsr3_dumps_left == 0) {
++        return;
++    }
++    const VkExtent2D extent{.width = destination->width, .height = destination->height};
++    const VkDeviceSize size = static_cast<VkDeviceSize>(extent.width) * extent.height * COLOR_CHANNELS;
++    const auto dump = [&](const std::string& name, VkImage image) {
++        vk::Buffer buffer = CreateWrappedBuffer(memory_allocator, size, MemoryUsage::Download);
++        scheduler.RequestOutsideRenderPassOperationContext();
++        scheduler.Record([image, dst = *buffer, extent](vk::CommandBuffer cmdbuf) {
++            DownloadColorImage(cmdbuf, image, dst,
++                               VkExtent3D{.width = extent.width, .height = extent.height, .depth = 1});
++        });
++        scheduler.Finish();
++        buffer.Invalidate();
++        WriteColorPpm(directory / (name + ".ppm"), extent, buffer.Mapped(), IsBlueFirst(built_format));
++    };
++    const std::string prefix = fmt::format("fg{:03}_", fsr3_dump_index);
++    if (generation == 0) {
++        dump(prefix + "a", fsr3_chain->HistoryImage());
++        dump(prefix + "c", fsr3_chain->CurrentImage());
++    }
++    dump(prefix + "b" + std::to_string(generation), *destination->image);
++    if (generation + 1 >= last_generations) {
++        --fsr3_dumps_left;
++        ++fsr3_dump_index;
++    }
++}
++
+ void FrameGen::DumpDebugImages(u64 count) {
+     const std::filesystem::path directory =
+         Common::FS::GetEdenPath(Common::FS::EdenPath::LosslessDir) / "debug";
+diff --git a/src/video_core/renderer_vulkan/present/frame_gen.h b/src/video_core/renderer_vulkan/present/frame_gen.h
+index 76513d9e17..fe1e4088c4 100644
+--- a/src/video_core/renderer_vulkan/present/frame_gen.h
++++ b/src/video_core/renderer_vulkan/present/frame_gen.h
+@@ -46,6 +46,7 @@ public:
+ private:
+     void Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale);
+     void DumpDebugImages(u64 count);
++    void DumpGeneratedFrame(Frame* destination, size_t generation);
+ 
+     MemoryAllocator& memory_allocator;
+     Scheduler& scheduler;
+@@ -68,6 +69,8 @@ private:
+     bool dumped{};
+     std::atomic<VideoCore::FrameGenState> state{VideoCore::FrameGenState::Pending};
+     std::atomic<u64> generated_frames{};
++    u32 fsr3_dumps_left{}; ///< game frames whose generated frames are still to be dumped
++    u32 fsr3_dump_index{};
+     u32 frames_without_storage{};
+     u32 reported{}; ///< REPORTED_* log lines already written since frame generation was turned on
+     static constexpr u32 REPORTED_NO_LSFG = 1U << 0;
+diff --git a/src/video_core/renderer_vulkan/present/fsr3_frame_gen.cpp b/src/video_core/renderer_vulkan/present/fsr3_frame_gen.cpp
+index 1c2be1f567..240df25b40 100644
+--- a/src/video_core/renderer_vulkan/present/fsr3_frame_gen.cpp
++++ b/src/video_core/renderer_vulkan/present/fsr3_frame_gen.cpp
+@@ -9,8 +9,11 @@
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ 
++#include "video_core/host_shaders/fg_flow_median_comp_spv.h"
++#include "video_core/host_shaders/fg_flow_refine_comp_spv.h"
++#include "video_core/host_shaders/fg_flow_search_comp_spv.h"
++#include "video_core/host_shaders/fg_luma_down_comp_spv.h"
+ #include "video_core/host_shaders/fsr3_frame_interpolation_comp_spv.h"
+-#include "video_core/host_shaders/fsr3_optical_flow_comp_spv.h"
+ 
+ namespace Vulkan {
+ 
+@@ -34,21 +37,6 @@ VkImageMemoryBarrier MakeBarrier(VkImage image, VkAccessFlags src_access,
+     };
+ }
+ 
+-void BarrierComputeWriteToRead(vk::CommandBuffer cmdbuf, VkImage image) {
+-    const auto barrier = MakeBarrier(image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+-                                     VK_IMAGE_LAYOUT_GENERAL,
+-                                     VK_IMAGE_LAYOUT_GENERAL);
+-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
+-}
+-
+-void DiscardForComputeWrite(vk::CommandBuffer cmdbuf, VkImage image) {
+-    const auto barrier = MakeBarrier(image, 0, VK_ACCESS_SHADER_WRITE_BIT,
+-                                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
+-}
+-
+ // ΓöÇΓöÇ Batched dual-copy ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+ // Copy one source image into TWO destinations with only 3 barrier calls
+ // instead of 6 (avoiding redundant source transitions).
+@@ -64,18 +52,16 @@ void CopyImageToTwo(vk::CommandBuffer cmdbuf, VkImage source,
+ 
+     // 1. Transition source ΓåÆ TRANSFER_SRC, both dests ΓåÆ TRANSFER_DST (batched)
+     const std::array before{
+-        MakeBarrier(source, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+-                                VK_ACCESS_TRANSFER_WRITE_BIT,
++        MakeBarrier(source, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+-        MakeBarrier(dest_a, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+-                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+-        MakeBarrier(dest_b, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+-                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
++        MakeBarrier(dest_a, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
++        MakeBarrier(dest_b, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+     };
+     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+-                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+-                               VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before);
+ 
+     // 2. Copy source ΓåÆ dest_a, then source ΓåÆ dest_b (source stays TRANSFER_SRC)
+@@ -100,7 +86,8 @@ void CopyImageToTwo(vk::CommandBuffer cmdbuf, VkImage source,
+                            0, {}, {}, after);
+ }
+ 
+-void CopyImageToImage(vk::CommandBuffer cmdbuf, VkImage source, VkImage destination,
++// Single-image copy (for first-frame init)
++[[maybe_unused]] void CopyImageToImage(vk::CommandBuffer cmdbuf, VkImage source, VkImage destination,
+                       VkExtent2D extent) {
+     const VkImageCopy region{
+         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+@@ -111,16 +98,14 @@ void CopyImageToImage(vk::CommandBuffer cmdbuf, VkImage source, VkImage destinat
+     };
+ 
+     const std::array before{
+-        MakeBarrier(source, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+-                                VK_ACCESS_TRANSFER_WRITE_BIT,
++        MakeBarrier(source, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+         MakeBarrier(destination, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+     };
+     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+-                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+-                               VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before);
+ 
+     cmdbuf.CopyImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
+@@ -139,15 +124,58 @@ void CopyImageToImage(vk::CommandBuffer cmdbuf, VkImage source, VkImage destinat
+                            0, {}, {}, after);
+ }
+ 
+-} // anonymous namespace
+ 
+-struct FlowPushConstants {
+-    float inv_render_w;
+-    float inv_render_h;
+-    float render_w;
+-    float render_h;
+-    float search_radius;
+-    float block_size;
++
++// Every compute pass of the flow reads what the one before wrote.
++void ComputeToCompute(vk::CommandBuffer cmdbuf) {
++    const VkMemoryBarrier barrier{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++    };
++    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
++}
++
++u32 Groups(u32 size) {
++    return (size + 7) / 8;
++}
++
++// Brightness differences are in 0..1 per texel; this many per texel of vector length keeps flat
++// areas at zero motion without outweighing a real match.
++constexpr float LAMBDA = 0.0002f;
++constexpr s32 COARSE_RADIUS = 6;
++constexpr size_t MAX_INTERP_SETS = 8;
++
++struct DownPushConstants {
++    s32 dst_w;
++    s32 dst_h;
++    float inv_src_w;
++    float inv_src_h;
++    s32 factor;
++    s32 from_rgb;
++};
++
++struct SearchPushConstants {
++    s32 w;
++    s32 h;
++    s32 radius;
++    float lambda;
++};
++
++struct RefinePushConstants {
++    s32 w;
++    s32 h;
++    s32 coarse_w;
++    s32 coarse_h;
++    s32 ratio;
++    float lambda;
++};
++
++struct MedianPushConstants {
++    s32 w;
++    s32 h;
+ };
+ 
+ struct InterpPushConstants {
+@@ -156,17 +184,33 @@ struct InterpPushConstants {
+     float render_w;
+     float render_h;
+     float blend_factor;
+-    float flow_scale;
++    float texel_pixels;
+ };
+ 
++VkWriteDescriptorSet StorageWrite(const VkDescriptorImageInfo& info, VkDescriptorSet set,
++                                  u32 binding) {
++    return VkWriteDescriptorSet{
++        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++        .pNext = nullptr,
++        .dstSet = set,
++        .dstBinding = binding,
++        .dstArrayElement = 0,
++        .descriptorCount = 1,
++        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++        .pImageInfo = &info,
++        .pBufferInfo = nullptr,
++        .pTexelBufferView = nullptr,
++    };
++}
++
++} // anonymous namespace
++
+ Fsr3FrameGen::Fsr3FrameGen(const Device& device, MemoryAllocator& memory_allocator,
+                            VkExtent2D extent, VkFormat format)
+-    : m_allocator{memory_allocator}, m_extent{extent},
+-      m_flow_extent{(std::max)(1u, extent.width / 2), (std::max)(1u, extent.height / 2)},
+-      m_format{format} {
++    : m_allocator{memory_allocator}, m_extent{extent}, m_format{format} {
+     CreateResources(device);
+-    CreateShaders(device);
+-    CreatePipelines(device);
++    CreatePasses(device);
++    WriteFlowDescriptors(device);
+     m_initialized = true;
+ }
+ 
+@@ -175,243 +219,311 @@ Fsr3FrameGen::~Fsr3FrameGen() = default;
+ void Fsr3FrameGen::CreateResources(const Device& device) {
+     m_linear_sampler = CreateBilinearSampler(device);
+ 
+-    m_history_image = CreateWrappedImage(m_allocator, m_extent, m_format);
+-    m_history_view = CreateWrappedImageView(device, m_history_image, m_format);
+-
+-    // Current-frame copy for interpolation shader
+-    m_current_image = m_allocator.CreateImage(VkImageCreateInfo{
+-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+-        .imageType = VK_IMAGE_TYPE_2D,
+-        .format = m_format,
+-        .extent = {m_extent.width, m_extent.height, 1},
+-        .mipLevels = 1,
+-        .arrayLayers = 1,
+-        .samples = VK_SAMPLE_COUNT_1_BIT,
+-        .tiling = VK_IMAGE_TILING_OPTIMAL,
+-        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+-                 VK_IMAGE_USAGE_SAMPLED_BIT,
+-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+-    });
+-    m_current_view = CreateWrappedImageView(device, m_current_image, m_format);
+-
+-    // Half-resolution motion vector image
+-    m_motion_image = CreateWrappedImage(m_allocator, m_flow_extent, VK_FORMAT_R16G16_SFLOAT);
+-    m_motion_view = CreateWrappedImageView(device, m_motion_image, VK_FORMAT_R16G16_SFLOAT);
++    const auto make = [&](VkExtent2D size, VkFormat format, VkImageUsageFlags extra = 0) {
++        OwnedImage owned;
++        owned.extent = size;
++        owned.image = CreateWrappedImage(m_allocator, size, format, extra);
++        owned.view = CreateWrappedImageView(device, owned.image, format);
++        return owned;
++    };
++    m_history = make(m_extent, m_format);
++    // Copied into the history every frame, so it must be a transfer source too (AMD drivers pick
++    // the image's compression from its usage flags).
++    m_current = make(m_extent, m_format, VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
++
++    for (size_t level = 0; level < LevelFactors.size(); ++level) {
++        // Whole blocks only, so the downsample never reads past the frame's edge.
++        const VkExtent2D size{(std::max)(1u, m_extent.width / LevelFactors[level]),
++                              (std::max)(1u, m_extent.height / LevelFactors[level])};
++        for (auto& pyramid : m_pyramid) {
++            pyramid[level] = make(size, VK_FORMAT_R16_SFLOAT);
++        }
++        m_vectors[level] = make(size, VK_FORMAT_R16G16_SFLOAT);
++    }
++    m_final_vectors = make(m_vectors[0].extent, VK_FORMAT_R16G16_SFLOAT);
+ 
++    // Sets: 2 x 3 downsample, 2 search, 2 x 2 refine, 1 median, up to MAX_INTERP_SETS.
++    constexpr u32 max_sets = 6 + 2 + 4 + 1 + MAX_INTERP_SETS;
+     const std::array pool_sizes{
+-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
++        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++                             6 + 2 * 2 + 4 * 3 + 1 + MAX_INTERP_SETS * 3},
++        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_sets},
+     };
+     m_desc_pool = device.GetLogical().CreateDescriptorPool(VkDescriptorPoolCreateInfo{
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+-        .maxSets = 1,
++        .pNext = nullptr,
++        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
++        .maxSets = max_sets,
+         .poolSizeCount = static_cast<u32>(pool_sizes.size()),
+         .pPoolSizes = pool_sizes.data(),
+     });
+ }
+ 
+-void Fsr3FrameGen::CreateShaders(const Device& device) {
+-    m_flow_shader = BuildShader(device, FSR3_OPTICAL_FLOW_COMP_SPV);
+-    m_interp_shader = BuildShader(device, FSR3_FRAME_INTERPOLATION_COMP_SPV);
++void Fsr3FrameGen::CreatePasses(const Device& device) {
++    m_shaders = {
++        BuildShader(device, FG_LUMA_DOWN_COMP_SPV),
++        BuildShader(device, FG_FLOW_SEARCH_COMP_SPV),
++        BuildShader(device, FG_FLOW_REFINE_COMP_SPV),
++        BuildShader(device, FG_FLOW_MEDIAN_COMP_SPV),
++        BuildShader(device, FSR3_FRAME_INTERPOLATION_COMP_SPV),
++    };
++    const auto make = [&](Pass& pass, size_t sampled, u32 push_size, VkShaderModule shader) {
++        std::vector<VkDescriptorType> types(sampled, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
++        types.push_back(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
++        pass.set_layout = CreateWrappedDescriptorSetLayout(
++            device, std::span<const VkDescriptorType>{types}, VK_SHADER_STAGE_COMPUTE_BIT);
++        const VkPushConstantRange push_range{
++            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++            .offset = 0,
++            .size = push_size,
++        };
++        pass.pipeline_layout = device.GetLogical().CreatePipelineLayout(VkPipelineLayoutCreateInfo{
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++            .pNext = nullptr,
++            .flags = 0,
++            .setLayoutCount = 1,
++            .pSetLayouts = pass.set_layout.address(),
++            .pushConstantRangeCount = 1,
++            .pPushConstantRanges = &push_range,
++        });
++        pass.pipeline = CreateWrappedComputePipeline(device, pass.pipeline_layout, shader);
++    };
++    make(m_down, 1, sizeof(DownPushConstants), *m_shaders[0]);
++    make(m_search, 2, sizeof(SearchPushConstants), *m_shaders[1]);
++    make(m_refine, 3, sizeof(RefinePushConstants), *m_shaders[2]);
++    make(m_median, 1, sizeof(MedianPushConstants), *m_shaders[3]);
++    make(m_interp, 3, sizeof(InterpPushConstants), *m_shaders[4]);
+ }
+ 
+-void Fsr3FrameGen::CreatePipelines(const Device& device) {
+-    // ΓöÇΓöÇ Optical Flow Pipeline ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+-    const std::array flow_bindings{
+-        VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+-        VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+-        VkDescriptorSetLayoutBinding{2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
++void Fsr3FrameGen::WriteFlowDescriptors(const Device& device) {
++    const auto allocate = [&](Pass& pass, size_t count) {
++        std::vector<VkDescriptorSetLayout> layouts(count, *pass.set_layout);
++        return CreateWrappedDescriptorSets(m_desc_pool, layouts);
+     };
+-
+-    m_flow_desc_layout = device.GetLogical().CreateDescriptorSetLayout(VkDescriptorSetLayoutCreateInfo{
+-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+-        .bindingCount = static_cast<u32>(flow_bindings.size()),
+-        .pBindings = flow_bindings.data(),
+-    });
+-
+-    const VkPushConstantRange flow_push_range{
+-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+-        .offset = 0,
+-        .size = sizeof(FlowPushConstants),
++    std::vector<VkDescriptorImageInfo> sampled;
++    sampled.reserve(64);
++    std::vector<VkDescriptorImageInfo> storage;
++    storage.reserve(32);
++    std::vector<VkWriteDescriptorSet> writes;
++    const auto sample = [&](VkImageView view, VkDescriptorSet set, u32 binding) {
++        writes.push_back(CreateWriteDescriptorSet(sampled, *m_linear_sampler, view, set, binding));
++    };
++    const auto store = [&](VkImageView view, VkDescriptorSet set, u32 binding) {
++        const auto& info = storage.emplace_back(VkDescriptorImageInfo{
++            .sampler = VK_NULL_HANDLE,
++            .imageView = view,
++            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
++        });
++        writes.push_back(StorageWrite(info, set, binding));
+     };
+ 
+-    m_flow_pipe_layout = device.GetLogical().CreatePipelineLayout(VkPipelineLayoutCreateInfo{
+-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+-        .setLayoutCount = 1,
+-        .pSetLayouts = m_flow_desc_layout.address(),
+-        .pushConstantRangeCount = 1,
+-        .pPushConstantRanges = &flow_push_range,
+-    });
++    for (size_t parity = 0; parity < 2; ++parity) {
++        const auto& current = m_pyramid[parity];
++        const auto& previous = m_pyramid[1 - parity];
++
++        m_down_sets[parity] = allocate(m_down, 3);
++        sample(*m_current.view, m_down_sets[parity][0], 0);
++        store(*current[0].view, m_down_sets[parity][0], 1);
++        for (size_t level = 1; level < 3; ++level) {
++            sample(*current[level - 1].view, m_down_sets[parity][level], 0);
++            store(*current[level].view, m_down_sets[parity][level], 1);
++        }
++
++        m_search_sets[parity] = allocate(m_search, 1);
++        sample(*current[2].view, m_search_sets[parity][0], 0);
++        sample(*previous[2].view, m_search_sets[parity][0], 1);
++        store(*m_vectors[2].view, m_search_sets[parity][0], 2);
++
++        // [0] refines level 1 from level 2, [1] level 0 from level 1.
++        m_refine_sets[parity] = allocate(m_refine, 2);
++        for (size_t i = 0; i < 2; ++i) {
++            const size_t level = 1 - i;
++            sample(*current[level].view, m_refine_sets[parity][i], 0);
++            sample(*previous[level].view, m_refine_sets[parity][i], 1);
++            sample(*m_vectors[level + 1].view, m_refine_sets[parity][i], 2);
++            store(*m_vectors[level].view, m_refine_sets[parity][i], 3);
++        }
++    }
++    m_median_set = allocate(m_median, 1);
++    sample(*m_vectors[0].view, m_median_set[0], 0);
++    store(*m_final_vectors.view, m_median_set[0], 1);
+ 
+-    m_flow_pipeline = device.GetLogical().CreateComputePipeline(VkComputePipelineCreateInfo{
+-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+-        .stage = {
+-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+-            .module = *m_flow_shader,
+-            .pName = "main",
+-        },
+-        .layout = *m_flow_pipe_layout,
+-    });
++    device.GetLogical().UpdateDescriptorSets(writes, {});
++}
+ 
+-    // ΓöÇΓöÇ Frame Interpolation Pipeline ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+-    const std::array interp_bindings{
+-        VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+-        VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+-        VkDescriptorSetLayoutBinding{2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+-        VkDescriptorSetLayoutBinding{3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
++VkDescriptorSet Fsr3FrameGen::InterpolationSet(const Device& device, Scheduler& scheduler,
++                                               VkImageView destination) {
++    for (const auto& entry : m_interp_sets) {
++        if (entry.destination == destination) {
++            return entry.set[0];
++        }
++    }
++    if (m_interp_sets.size() >= MAX_INTERP_SETS) {
++        // The presented frames were recreated: wait until no command uses the old sets.
++        scheduler.Finish();
++        m_interp_sets.clear();
++    }
++    std::vector<VkDescriptorSetLayout> layouts{*m_interp.set_layout};
++    auto& entry = m_interp_sets.emplace_back(
++        InterpSet{destination, CreateWrappedDescriptorSets(m_desc_pool, layouts)});
++
++    std::vector<VkDescriptorImageInfo> sampled;
++    sampled.reserve(3);
++    std::vector<VkWriteDescriptorSet> writes{
++        CreateWriteDescriptorSet(sampled, *m_linear_sampler, *m_current.view, entry.set[0], 0),
++        CreateWriteDescriptorSet(sampled, *m_linear_sampler, *m_history.view, entry.set[0], 1),
++        CreateWriteDescriptorSet(sampled, *m_linear_sampler, *m_final_vectors.view, entry.set[0],
++                                 2),
+     };
+-
+-    m_interp_desc_layout = device.GetLogical().CreateDescriptorSetLayout(VkDescriptorSetLayoutCreateInfo{
+-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+-        .bindingCount = static_cast<u32>(interp_bindings.size()),
+-        .pBindings = interp_bindings.data(),
+-    });
+-
+-    const VkPushConstantRange interp_push_range{
+-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+-        .offset = 0,
+-        .size = sizeof(InterpPushConstants),
++    const VkDescriptorImageInfo destination_info{
++        .sampler = VK_NULL_HANDLE,
++        .imageView = destination,
++        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+     };
++    writes.push_back(StorageWrite(destination_info, entry.set[0], 3));
++    device.GetLogical().UpdateDescriptorSets(writes, {});
++    return entry.set[0];
++}
+ 
+-    m_interp_pipe_layout = device.GetLogical().CreatePipelineLayout(VkPipelineLayoutCreateInfo{
+-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+-        .setLayoutCount = 1,
+-        .pSetLayouts = m_interp_desc_layout.address(),
+-        .pushConstantRangeCount = 1,
+-        .pPushConstantRanges = &interp_push_range,
+-    });
+-
+-    m_interp_pipeline = device.GetLogical().CreateComputePipeline(VkComputePipelineCreateInfo{
+-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+-        .stage = {
+-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+-            .module = *m_interp_shader,
+-            .pName = "main",
+-        },
+-        .layout = *m_interp_pipe_layout,
+-    });
+-
+-    // Allocate descriptor sets
+-    m_flow_desc_sets = CreateWrappedDescriptorSets(m_desc_pool, {*m_flow_desc_layout});
++void Fsr3FrameGen::RecordPyramid(vk::CommandBuffer cmdbuf, size_t parity) const {
++    cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_down.pipeline);
++    for (size_t level = 0; level < 3; ++level) {
++        const VkExtent2D source = level == 0 ? m_extent : m_pyramid[parity][level - 1].extent;
++        const VkExtent2D destination = m_pyramid[parity][level].extent;
++        const DownPushConstants constants{
++            .dst_w = static_cast<s32>(destination.width),
++            .dst_h = static_cast<s32>(destination.height),
++            .inv_src_w = 1.0f / static_cast<float>(source.width),
++            .inv_src_h = 1.0f / static_cast<float>(source.height),
++            .factor = level == 0 ? static_cast<s32>(LevelFactors[0])
++                                 : static_cast<s32>(LevelFactors[level] / LevelFactors[level - 1]),
++            .from_rgb = level == 0 ? 1 : 0,
++        };
++        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_down.pipeline_layout, 0,
++                                  m_down_sets[parity][level], {});
++        cmdbuf.PushConstants(*m_down.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
++        cmdbuf.Dispatch(Groups(destination.width), Groups(destination.height), 1);
++        ComputeToCompute(cmdbuf);
++    }
+ }
+ 
+ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
+-                           VkImageView, u64 frame_count) {
++                           VkImageView current_view, u64 frame_count) {
++    static_cast<void>(device);
++    static_cast<void>(current_view);
++
++    if (!m_layouts_ready) {
++        scheduler.Record([this](vk::CommandBuffer cmdbuf) {
++            std::vector<VkImageMemoryBarrier> barriers;
++            const auto add = [&](const OwnedImage& owned) {
++                barriers.push_back(MakeBarrier(*owned.image, 0,
++                                               VK_ACCESS_SHADER_READ_BIT |
++                                                   VK_ACCESS_SHADER_WRITE_BIT,
++                                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL));
++            };
++            for (const auto& pyramid : m_pyramid) {
++                for (const auto& level : pyramid) {
++                    add(level);
++                }
++            }
++            for (const auto& level : m_vectors) {
++                add(level);
++            }
++            add(m_final_vectors);
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barriers);
++        });
++        m_layouts_ready = true;
++    }
++
+     if (!m_has_history) {
+-        // First frame: populate history and current-frame copy via batched dual-copy
+-        scheduler.Record([this, current_frame](vk::CommandBuffer cmdbuf) {
+-            CopyImageToTwo(cmdbuf, current_frame, *m_history_image, *m_current_image, m_extent);
+-            DiscardForComputeWrite(cmdbuf, *m_motion_image);
++        // First frame: it is both frames, and its pyramid the previous one for the next frame.
++        const size_t parity = m_parity;
++        scheduler.Record([this, current_frame, parity](vk::CommandBuffer cmdbuf) {
++            CopyImageToTwo(cmdbuf, current_frame, *m_history.image, *m_current.image, m_extent);
++            RecordPyramid(cmdbuf, parity);
+         });
+         m_has_history = true;
+         m_last_frame_count = frame_count;
+         return;
+     }
+ 
+-    // ΓöÇΓöÇ Duplicate-frame detection ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+-    if (frame_count == m_last_frame_count) {
++    // ── Duplicate-frame detection ──
++    if (frame_count == m_last_frame_count && m_flow_valid) {
+         return;
+     }
+     m_last_frame_count = frame_count;
+-
+-    // ΓöÇΓöÇ Descriptor caching ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+-    if (!m_flow_descriptors_initialized) {
+-        std::vector<VkDescriptorImageInfo> image_infos;
+-        image_infos.reserve(4);
+-        std::vector<VkWriteDescriptorSet> updates{
+-            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_current_view, m_flow_desc_sets[0], 0),
+-            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_history_view, m_flow_desc_sets[0], 1),
++    m_parity = 1 - m_parity;
++    const size_t parity = m_parity;
++
++    scheduler.Record([this, current_frame, parity](vk::CommandBuffer cmdbuf) {
++        // The last real frame becomes the history and this one the current copy, before the flow
++        // reads them: Generate() interpolates between the two.
++        CopyImageToImage(cmdbuf, *m_current.image, *m_history.image, m_extent);
++        CopyImageToImage(cmdbuf, current_frame, *m_current.image, m_extent);
++        // The previous frame's passes read the images this frame's passes write.
++        ComputeToCompute(cmdbuf);
++
++        RecordPyramid(cmdbuf, parity);
++
++        const VkExtent2D coarse = m_vectors[2].extent;
++        const SearchPushConstants search{
++            .w = static_cast<s32>(coarse.width),
++            .h = static_cast<s32>(coarse.height),
++            .radius = COARSE_RADIUS,
++            .lambda = LAMBDA,
+         };
+-
+-        const VkDescriptorImageInfo motion_store_info{
+-            .imageView = *m_motion_view,
+-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
++        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_search.pipeline);
++        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_search.pipeline_layout, 0,
++                                  m_search_sets[parity][0], {});
++        cmdbuf.PushConstants(*m_search.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, search);
++        cmdbuf.Dispatch(Groups(coarse.width), Groups(coarse.height), 1);
++        ComputeToCompute(cmdbuf);
++
++        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_refine.pipeline);
++        for (size_t i = 0; i < 2; ++i) {
++            const size_t level = 1 - i;
++            const VkExtent2D size = m_vectors[level].extent;
++            const VkExtent2D from = m_vectors[level + 1].extent;
++            const RefinePushConstants refine{
++                .w = static_cast<s32>(size.width),
++                .h = static_cast<s32>(size.height),
++                .coarse_w = static_cast<s32>(from.width),
++                .coarse_h = static_cast<s32>(from.height),
++                .ratio = static_cast<s32>(LevelFactors[level + 1] / LevelFactors[level]),
++                .lambda = LAMBDA,
++            };
++            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_refine.pipeline_layout,
++                                      0, m_refine_sets[parity][i], {});
++            cmdbuf.PushConstants(*m_refine.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, refine);
++            cmdbuf.Dispatch(Groups(size.width), Groups(size.height), 1);
++            ComputeToCompute(cmdbuf);
++        }
++
++        const VkExtent2D fine = m_final_vectors.extent;
++        const MedianPushConstants median{
++            .w = static_cast<s32>(fine.width),
++            .h = static_cast<s32>(fine.height),
+         };
+-        updates.push_back(VkWriteDescriptorSet{
+-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+-            .dstSet = m_flow_desc_sets[0],
+-            .dstBinding = 2,
+-            .descriptorCount = 1,
+-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+-            .pImageInfo = &motion_store_info,
+-        });
+-        device.GetLogical().UpdateDescriptorSets(updates, {});
+-        m_flow_descriptors_initialized = true;
+-    }
+-
+-    // Dispatch Optical Flow at half resolution
+-    const u32 flow_w = m_flow_extent.width;
+-    const u32 flow_h = m_flow_extent.height;
+-    const FlowPushConstants constants{
+-        .inv_render_w = 1.0f / static_cast<float>(flow_w),
+-        .inv_render_h = 1.0f / static_cast<float>(flow_h),
+-        .render_w = static_cast<float>(flow_w),
+-        .render_h = static_cast<float>(flow_h),
+-        .search_radius = 2.0f,
+-        .block_size = 2.0f,
+-    };
+-
+-    scheduler.Record([this, constants, current_frame, flow_w, flow_h](vk::CommandBuffer cmdbuf) {
+-        CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
+-        CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
+-
+-        const auto barrier = MakeBarrier(*m_motion_image,
+-                                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+-                                         VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+-                                         VK_IMAGE_LAYOUT_GENERAL);
+-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
+-
+-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipeline);
+-        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipe_layout, 0,
+-                                  m_flow_desc_sets[0], {});
+-        cmdbuf.PushConstants(*m_flow_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
+-        cmdbuf.Dispatch((flow_w + 15) / 16, (flow_h + 15) / 16, 1);
+-
+-        BarrierComputeWriteToRead(cmdbuf, *m_motion_image);
++        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_median.pipeline);
++        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_median.pipeline_layout, 0,
++                                  m_median_set[0], {});
++        cmdbuf.PushConstants(*m_median.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, median);
++        cmdbuf.Dispatch(Groups(fine.width), Groups(fine.height), 1);
++        ComputeToCompute(cmdbuf);
+     });
+ 
+     m_flow_valid = true;
+ }
+ 
+-void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler, VkImage destination,
++void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler,
+                             VkImageView destination_storage_view, float blend_factor,
+                             float flow_scale) {
++    static_cast<void>(flow_scale);
+     if (!m_has_history || !m_flow_valid) {
+         return;
+     }
+-
+-    // ΓöÇΓöÇ Descriptor caching for interpolation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+-    if (!m_interp_pool) {
+-        m_interp_pool.emplace(device, scheduler);
+-        m_interp_allocator = m_interp_pool->Allocator(device, scheduler, *m_interp_desc_layout,
+-                                                      DescriptorBankInfo{.textures = 3, .images = 1});
+-    }
+-    const VkDescriptorSet set = m_interp_allocator.Commit();
+-    std::vector<VkDescriptorImageInfo> image_infos;
+-    image_infos.reserve(4);
+-    std::vector<VkWriteDescriptorSet> updates{
+-        CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_current_view, set, 0),
+-        CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_history_view, set, 1),
+-        CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_motion_view, set, 2),
+-    };
+-
+-    const VkDescriptorImageInfo dest_info{
+-        .imageView = destination_storage_view,
+-        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+-    };
+-    updates.push_back(VkWriteDescriptorSet{
+-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+-        .dstSet = set,
+-        .dstBinding = 3,
+-        .descriptorCount = 1,
+-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+-        .pImageInfo = &dest_info,
+-    });
+-    device.GetLogical().UpdateDescriptorSets(updates, {});
++    const VkDescriptorSet set = InterpolationSet(device, scheduler, destination_storage_view);
+ 
+     // Interpolation dispatches at full resolution
+     const u32 out_w = m_extent.width;
+@@ -422,16 +534,15 @@ void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler, VkImage
+         .render_w = static_cast<float>(out_w),
+         .render_h = static_cast<float>(out_h),
+         .blend_factor = blend_factor,
+-        .flow_scale = flow_scale,
++        .texel_pixels = static_cast<float>(LevelFactors[0]),
+     };
+ 
+-    scheduler.Record([this, constants, out_w, out_h, set, destination](vk::CommandBuffer cmdbuf) {
+-        DiscardForComputeWrite(cmdbuf, destination);
+-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp_pipeline);
+-        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp_pipe_layout, 0,
++    scheduler.Record([this, set, constants, out_w, out_h](vk::CommandBuffer cmdbuf) {
++        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp.pipeline);
++        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_interp.pipeline_layout, 0,
+                                   set, {});
+-        cmdbuf.PushConstants(*m_interp_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
+-        cmdbuf.Dispatch((out_w + 15) / 16, (out_h + 15) / 16, 1);
++        cmdbuf.PushConstants(*m_interp.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
++        cmdbuf.Dispatch(Groups(out_w), Groups(out_h), 1);
+     });
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/present/fsr3_frame_gen.h b/src/video_core/renderer_vulkan/present/fsr3_frame_gen.h
+index dd0c787ad8..558086eca8 100644
+--- a/src/video_core/renderer_vulkan/present/fsr3_frame_gen.h
++++ b/src/video_core/renderer_vulkan/present/fsr3_frame_gen.h
+@@ -4,11 +4,9 @@
+ #pragma once
+ 
+ #include <array>
+-#include <optional>
+ #include <vector>
+ 
+ #include "common/common_types.h"
+-#include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
+@@ -17,17 +15,14 @@ namespace Vulkan {
+ class Device;
+ class Scheduler;
+ 
+-/// AMD FidelityFX Super Resolution 3 (FSR 3) Frame Generation pipeline.
+-/// Uses compute-based optical flow and bilateral frame interpolation
+-/// to synthesize intermediate frames without requiring engine motion vectors.
+-///
+-/// Optimizations:
+-///  - Quarter-resolution optical flow (16├ù fewer compute invocations)
+-///  - Shared-memory tile caching in both shaders
+-///  - Early-out for static pixels (skip diamond search)
+-///  - Duplicate-frame detection (skip optical flow entirely)
+-///  - Precise pipeline barriers instead of full-pipeline TransitionImageLayout
+-///  - Descriptor-write caching (only update when image views change)
++/// The built-in frame generation ("FSR3" in the settings; it doesn't use AMD's FSR 3 code).
++/// Estimates motion between the last two game frames from the picture alone and builds the frames
++/// between them:
++///  - each game frame: a brightness pyramid at 1/8, 1/16 and 1/32 of the presented size, a full
++///    search at 1/32 (+-6 texels, so +-192 pixels), refinement at 1/16 and 1/8 from the median
++///    coarse vectors, and a 3x3 median of the result;
++///  - each generated frame: per pixel, the vector among a few nearby field vectors and zero whose
++///    previous-frame and current-frame samples agree best, then those two samples blended.
+ class Fsr3FrameGen {
+ public:
+     explicit Fsr3FrameGen(const Device& device, MemoryAllocator& memory_allocator,
+@@ -37,59 +32,87 @@ public:
+     void Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
+                  VkImageView current_view, u64 frame_count);
+ 
+-    void Generate(const Device& device, Scheduler& scheduler, VkImage destination,
+-                  VkImageView destination_storage_view, float blend_factor, float flow_scale);
++    void Generate(const Device& device, Scheduler& scheduler, VkImageView destination_storage_view,
++                  float blend_factor, float flow_scale);
+ 
+     [[nodiscard]] bool IsReady() const {
+-        return m_initialized && m_has_history && m_flow_valid;
++        return m_initialized && m_has_history;
+     }
+ 
++    /// The older and the newer of the two game frames being interpolated (debug dumps).
++    [[nodiscard]] VkImage HistoryImage() const {
++        return *m_history.image;
++    }
++    [[nodiscard]] VkImage CurrentImage() const {
++        return *m_current.image;
++    }
++
++    /// Presented pixels per texel of each pyramid level, finest first.
++    static constexpr std::array<u32, 3> LevelFactors{8, 16, 32};
++
+ private:
++    struct Pass {
++        vk::DescriptorSetLayout set_layout;
++        vk::PipelineLayout pipeline_layout;
++        vk::Pipeline pipeline;
++    };
++    struct OwnedImage {
++        vk::Image image;
++        vk::ImageView view;
++        VkExtent2D extent{};
++    };
++
+     void CreateResources(const Device& device);
+-    void CreateShaders(const Device& device);
+-    void CreatePipelines(const Device& device);
++    void CreatePasses(const Device& device);
++    void WriteFlowDescriptors(const Device& device);
++    VkDescriptorSet InterpolationSet(const Device& device, Scheduler& scheduler,
++                                     VkImageView destination);
++    void RecordPyramid(vk::CommandBuffer cmdbuf, size_t parity) const;
+ 
+     MemoryAllocator& m_allocator;
+     VkExtent2D m_extent;
+-    VkExtent2D m_flow_extent;   // half-res for optical flow
+     VkFormat m_format;
+ 
+     vk::Sampler m_linear_sampler;
+-    vk::ShaderModule m_flow_shader;
+-    vk::ShaderModule m_interp_shader;
+-
+-    vk::DescriptorSetLayout m_flow_desc_layout;
+-    vk::PipelineLayout m_flow_pipe_layout;
+-    vk::Pipeline m_flow_pipeline;
++    std::array<vk::ShaderModule, 5> m_shaders;
+ 
+-    vk::DescriptorSetLayout m_interp_desc_layout;
+-    vk::PipelineLayout m_interp_pipe_layout;
+-    vk::Pipeline m_interp_pipeline;
++    Pass m_down;
++    Pass m_search;
++    Pass m_refine;
++    Pass m_median;
++    Pass m_interp;
+ 
+     vk::DescriptorPool m_desc_pool;
+-    vk::DescriptorSets m_flow_desc_sets;
+-    std::optional<DescriptorPool> m_interp_pool;
+-    DescriptorAllocator m_interp_allocator;
+-
+-    // History and motion vector images
+-    vk::Image m_history_image;
+-    vk::ImageView m_history_view;
+-
+-    vk::Image m_motion_image;
+-    vk::ImageView m_motion_view;
+-
+-    // Store the last current-frame view for descriptor caching
+-    vk::Image m_current_image;
+-    vk::ImageView m_current_view;
+-
++    std::array<vk::DescriptorSets, 2> m_down_sets;   // per pyramid parity, one per level
++    std::array<vk::DescriptorSets, 2> m_search_sets; // per parity
++    std::array<vk::DescriptorSets, 2> m_refine_sets; // per parity, finest level first
++    vk::DescriptorSets m_median_set;
++
++    // Generated frames go to the presented frames' images, which rotate: one set per image so a
++    // set is never rewritten while an earlier frame's commands may still use it.
++    struct InterpSet {
++        VkImageView destination;
++        vk::DescriptorSets set;
++    };
++    std::vector<InterpSet> m_interp_sets;
++
++    // The last two game frames: history is the older one.
++    OwnedImage m_history;
++    OwnedImage m_current;
++
++    // Brightness pyramids of the last two game frames (swapped each frame) and motion fields.
++    std::array<std::array<OwnedImage, 3>, 2> m_pyramid;
++    std::array<OwnedImage, 3> m_vectors;
++    OwnedImage m_final_vectors;
++
++    size_t m_parity{};
+     bool m_initialized{};
+     bool m_has_history{};
++    bool m_layouts_ready{};
+ 
+-    // Duplicate-frame detection: skip optical flow when the frame hasn't changed
++    // Duplicate-frame detection: skip the flow when the frame hasn't changed
+     u64 m_last_frame_count{};
+     bool m_flow_valid{};
+-
+-    bool m_flow_descriptors_initialized{};
+ };
+ 
+ } // namespace Vulkan

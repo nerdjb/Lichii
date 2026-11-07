@@ -18,6 +18,26 @@ This is an independent fork, not an official release of those upstream projects.
 
 Visit the [official Lichii website](https://lichii.zortos.me) to find games and compare community compatibility reports.
 
+## This fork: AMD frame generation
+
+This is [nerdjb/Lichii](https://github.com/nerdjb/Lichii), a fork of
+[zortos293/Lichii](https://github.com/zortos293/Lichii) that carries the frame-generation work from
+[chuppatricky/Lichii](https://github.com/chuppatricky/Lichii) on top of current upstream `nx2`:
+
+- **Large-motion frame generation.** The built-in FSR3-style generator now builds a brightness
+  pyramid, searches and refines the motion field, and takes a median, so fast camera movement no
+  longer produces a double image.
+- **Paced generated frames.** Generated frames are spaced across the game frame's measured time
+  instead of being shown in a burst.
+- **Useful logs.** Frame generation now logs once whether it is running (and how many frames per
+  game frame), or why it is off (missing `Lossless.dll`, or a display format the GPU cannot write
+  from compute shaders).
+
+The default branch is `nx2-amd-framegen`. The `upstream-sync` workflow merges
+`zortos293/Lichii@nx2` every day, pushes the result, and starts `release-binaries`, so this fork's
+releases follow upstream automatically. Downloads are on
+[this fork's releases page](https://github.com/nerdjb/Lichii/releases).
+
 ## Downloads and setup
 
 Published builds belong on this fork's [releases page](https://github.com/zortos293/Eglantine/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.

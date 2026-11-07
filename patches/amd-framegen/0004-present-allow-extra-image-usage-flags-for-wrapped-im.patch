@@ -1,0 +1,52 @@
+From 53e7d844d2dd49baa885f8ad21a09432d5110715 Mon Sep 17 00:00:00 2001
+From: CachyOS <cachyos@local>
+Date: Sun, 8 Nov 2026 00:51:52 +0200
+Subject: [PATCH 4/4] present: allow extra image usage flags for wrapped images
+
+The large-motion frame generator gives its current-frame copy
+VK_IMAGE_USAGE_TRANSFER_SRC_BIT so AMD drivers pick a usable image
+compression. CreateWrappedImage needs a way to pass that extra usage.
+
+Fork glue for cdc0101d; the corresponding chuppa commit (da7f0965) was not part of PR #149.
+---
+ src/video_core/renderer_vulkan/present/util.cpp | 5 +++--
+ src/video_core/renderer_vulkan/present/util.h   | 3 ++-
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/present/util.cpp b/src/video_core/renderer_vulkan/present/util.cpp
+index 2ea7870f01..79535929c8 100644
+--- a/src/video_core/renderer_vulkan/present/util.cpp
++++ b/src/video_core/renderer_vulkan/present/util.cpp
+@@ -25,7 +25,8 @@ vk::Buffer CreateWrappedBuffer(MemoryAllocator& allocator, VkDeviceSize size, Me
+     return allocator.CreateBuffer(dst_buffer_info, usage);
+ }
+ 
+-vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, VkFormat format) {
++vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, VkFormat format,
++                             VkImageUsageFlags extra_usage) {
+     const VkImageCreateInfo image_ci{
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .pNext = nullptr,
+@@ -38,7 +39,7 @@ vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+-                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | extra_usage,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .queueFamilyIndexCount = 0,
+         .pQueueFamilyIndices = nullptr,
+diff --git a/src/video_core/renderer_vulkan/present/util.h b/src/video_core/renderer_vulkan/present/util.h
+index ecc263286d..45e10b2282 100644
+--- a/src/video_core/renderer_vulkan/present/util.h
++++ b/src/video_core/renderer_vulkan/present/util.h
+@@ -16,7 +16,8 @@ namespace Vulkan {
+ 
+ vk::Buffer CreateWrappedBuffer(MemoryAllocator& allocator, VkDeviceSize size, MemoryUsage usage);
+ 
+-vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, VkFormat format);
++vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, VkFormat format,
++                             VkImageUsageFlags extra_usage = 0);
+ void TransitionImageLayout(vk::CommandBuffer& cmdbuf, VkImage image, VkImageLayout target_layout,
+                            VkImageLayout source_layout = VK_IMAGE_LAYOUT_GENERAL);
+ void UploadImage(const Device& device, MemoryAllocator& allocator, Scheduler& scheduler,
