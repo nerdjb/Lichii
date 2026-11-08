@@ -217,7 +217,17 @@ jobs:
         shell: pwsh
         run: |
           $zip = Join-Path $env:RUNNER_TEMP 'sccache.zip'
-          Invoke-WebRequest -OutFile $zip https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.zip
+          $url = 'https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.zip'
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+              Invoke-WebRequest -OutFile $zip $url
+              break
+            } catch {
+              if ($attempt -eq 5) { throw }
+              Write-Host "Download failed (attempt $attempt/5): $($_.Exception.Message)"
+              Start-Sleep -Seconds (10 * $attempt)
+            }
+          }
           Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'sccache')
           $bin = (Get-ChildItem -Recurse -Filter sccache.exe (Join-Path $env:RUNNER_TEMP 'sccache')).DirectoryName
           $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
@@ -291,7 +301,19 @@ jobs:
               "-DCMAKE_CXX_FLAGS=$profile"
             )
           fi
-          cmake -S . -B build/release -G Ninja "${flags[@]}"
+          # CPM fetches its packages during configure, so a transient download error fails the job
+          # before compiling. Retry the configure with a fresh cache entry before giving up.
+          for attempt in 1 2 3; do
+            if cmake -S . -B build/release -G Ninja "${flags[@]}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "Configure failed (attempt $attempt/3), retrying after downloads settle"
+            rm -f build/release/CMakeCache.txt
+            sleep $((15 * attempt))
+          done
 
       # A profile older than the source only warns: functions changed since training lose their
       # profile data and are optimized as in the ThinLTO build. clang-cl 22 reads LLVM's indexed
