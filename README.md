@@ -34,9 +34,11 @@ current upstream `nx2`:
   from compute shaders).
 
 The branch is [nerdjb/Lichii `nx2-amd-framegen`](https://github.com/nerdjb/Lichii/tree/nx2-amd-framegen).
-It tracks upstream `nx2`: `tools/update-fork.sh` merges new upstream commits and pushes the result, so
-this fork stays current. Downloads are on the [releases page](https://github.com/nerdjb/Lichii/releases),
-and the built-in updater follows them so it will not replace this build with an upstream one.
+It tracks upstream `nx2`: `tools/update-fork.sh --release` merges new upstream commits, pushes the
+result, and publishes a fresh PGO build as the next `build-N` release. A systemd user timer runs it
+daily on the machine that owns the fork, because GitHub disables Actions here. Downloads are on the
+[releases page](https://github.com/nerdjb/Lichii/releases), and the built-in updater follows them so
+it will not replace this build with an upstream one.
 
 ## Downloads and setup
 
