@@ -214,6 +214,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_master_semaphore.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
+    renderer_vulkan/vk_pipeline_cache_records.cpp
+    renderer_vulkan/vk_pipeline_cache_records.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
     renderer_vulkan/vk_query_cache.cpp
@@ -302,6 +304,7 @@ add_library(video_core STATIC
     texture_cache/image_view_info.h
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
+    texture_cache/stale_pages.h
     texture_cache/texture_cache.cpp
     texture_cache/texture_cache.h
     texture_cache/texture_cache_base.h

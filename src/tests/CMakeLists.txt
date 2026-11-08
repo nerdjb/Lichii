@@ -28,12 +28,14 @@ add_executable(tests
     video_core/ampere_yoshi_title.cpp
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
+    video_core/join_whole_copy.cpp
     audio_core/batch_decoder.cpp
     audio_core/microphone.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
     core/builtin_patches.cpp
+    core/builtin_font_glyphs.cpp
     core/system_test_context.h
     video_core/ampere_branch_modifiers.cpp
     video_core/ampere_fast_fusion_logged.cpp
@@ -42,6 +44,7 @@ add_executable(tests
     video_core/vk_byte_addressed_shadow.cpp
     video_core/global_memory_coherence.cpp
     video_core/storage_buffer_pointer_tracking.cpp
+    video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
     core/nup_validation.cpp
     input_common/calibration_lifetime.cpp
@@ -177,6 +180,7 @@ add_executable(tests
     video_core/ampere_vote.cpp
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
+    video_core/stale_pages.cpp
     input_common/calibration_configuration_job.cpp
 )
 
