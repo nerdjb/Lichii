@@ -81,6 +81,17 @@ if [ "$build" != 1 ] || { [ "$changed" != 1 ] && [ "$force" != 1 ]; }; then
     exit 0
 fi
 
+# One published build per day: upstream often lands dozens of commits in a day, and a release per
+# batch would be noise. The first run of the day ships everything up to that point; later runs only
+# update the source unless --force is given.
+if [ "$release" = 1 ] && [ "$force" != 1 ]; then
+    published=$(gh release list -R "$repo_slug" --limit 1 --json publishedAt --jq '.[0].publishedAt // ""')
+    if [ "${published:0:10}" = "$(date -u +%F)" ]; then
+        echo "A release was already published today ($published); run with --force to publish again."
+        exit 0
+    fi
+fi
+
 # Continue the build numbering from whichever is higher, this fork or upstream, so the number
 # never looks older than upstream's releases.
 here=$(latest_build_number "$repo_slug")
