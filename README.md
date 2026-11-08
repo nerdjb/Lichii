@@ -43,6 +43,10 @@ follows those releases so it will not replace this build with an upstream one.
 
 ## Downloads and setup
 
+> **This fork's builds:** download from [nerdjb/Lichii-AMD releases](https://github.com/nerdjb/Lichii-AMD/releases).
+> The upstream paragraph below points at `zortos293/Lichii`, whose builds do **not** include AMD frame
+> generation.
+
 Download Lichii only from this repository's [releases page](https://github.com/zortos293/Lichii/releases). Lichii has no other download site: archives offered elsewhere, such as lichii.org, are not built by this project, and one has been reported to install malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
 
 On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
