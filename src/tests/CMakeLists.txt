@@ -66,6 +66,8 @@ add_executable(tests
     video_core/async_draw_policy.cpp
     video_core/async_shader_emission.cpp
     video_core/pipeline_build.cpp
+    video_core/oot_network.cpp
+    video_core/page_filter.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
@@ -97,6 +99,7 @@ add_executable(tests
     video_core/ampere_tennis_i2f.cpp
     video_core/ampere_tennis_tessellation.cpp
     video_core/pipeline_cache_files.cpp
+    video_core/shader_precache.cpp
     video_core/storage_binding_capacity.cpp
     video_core/native_indirect_reset.cpp
     video_core/native_qmd.cpp
@@ -136,6 +139,7 @@ add_executable(tests
     core/nup_writer.cpp
     core/nup_metadata.cpp
     core/nx2_image_layout.cpp
+    core/nx2_movie_clock.cpp
     core/nx2_video_input_queue.cpp
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
