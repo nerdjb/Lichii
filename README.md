@@ -41,7 +41,7 @@ follows those releases so it will not replace this build with an upstream one.
 
 ## Downloads and setup
 
-Published builds belong on this fork's [releases page](https://github.com/nerdjb/Lichii/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.
+Download Lichii only from this repository's [releases page](https://github.com/zortos293/Lichii/releases). Lichii has no other download site: archives offered elsewhere, such as lichii.org, are not built by this project, and one has been reported to install malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
 
 On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
 
