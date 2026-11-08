@@ -34,20 +34,13 @@ current upstream `nx2`:
   from compute shaders).
 
 The branch is [nerdjb/Lichii `nx2-amd-framegen`](https://github.com/nerdjb/Lichii/tree/nx2-amd-framegen).
-Builds and releases are published from [nerdjb/Lichii-AMD](https://github.com/nerdjb/Lichii-AMD),
-a non-fork mirror, because GitHub disables Actions on forks with heavy build usage. The
-`upstream-sync` workflow there merges `zortos293/Lichii@nx2` every day, pushes the result, and
-starts `release-binaries`, so releases follow upstream automatically. Downloads are on the
-[Lichii-AMD releases page](https://github.com/nerdjb/Lichii-AMD/releases), and the built-in updater
-follows those releases so it will not replace this build with an upstream one.
+It tracks upstream `nx2`: `tools/update-fork.sh` merges new upstream commits and pushes the result, so
+this fork stays current. Downloads are on the [releases page](https://github.com/nerdjb/Lichii/releases),
+and the built-in updater follows them so it will not replace this build with an upstream one.
 
 ## Downloads and setup
 
-> **This fork's builds:** download from [nerdjb/Lichii-AMD releases](https://github.com/nerdjb/Lichii-AMD/releases).
-> The upstream paragraph below points at `zortos293/Lichii`, whose builds do **not** include AMD frame
-> generation.
-
-Download Lichii only from this repository's [releases page](https://github.com/zortos293/Lichii/releases). Lichii has no other download site: archives offered elsewhere, such as lichii.org, are not built by this project, and one has been reported to install malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
+Download the AMD frame-generation builds from [this fork's releases page](https://github.com/nerdjb/Lichii/releases). Upstream builds are on [zortos293/Lichii releases](https://github.com/zortos293/Lichii/releases) and do not include frame generation. Lichii has no other download site: archives offered elsewhere, such as lichii.org, are not built by this project, and one has been reported to install malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
 
 On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
 
@@ -82,40 +75,6 @@ Keep changes focused and distinguish code-level checks from actual gameplay test
 ## Artwork
 Art created by YOB (yobslab)
 The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
-
-## Support Lichii
-
-Lichii is free and stays free. If you want to help, you can donate in crypto. Donations help pay for the AI tools and build machines used to develop this open-source project faster.
-
-**Solana (SOL)**
-```text
-JepEjfyWjGjhJvHSrqj52KtLjcbbbmUh1iGqerYBF4w
-```
-
-**Ethereum (ETH)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Bitcoin (BTC)**
-```text
-bc1qcvxdpf4qvdhqp8ee4s355cjmxrzsphsdwpl8w4
-```
-
-**BNB Smart Chain (BNB)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Polygon**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-Send each coin on its matching network. Coins sent on the wrong network can't be recovered.
-
-> [!NOTE]
-> Donations are voluntary gifts and are non-refundable. A donation does not buy any product, service, perk, early access, exclusive build, priority support or say in the project. Every release stays free and public for everyone.
 
 ## Credits and license
 
