@@ -21,6 +21,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
@@ -34,6 +35,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
 #include "video_core/texture_cache/conversion.h"
+#include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/host_mip_limits.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -140,6 +142,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+    const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -413,7 +416,6 @@ void TextureCache<P>::TickFrame() {
             if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 if (budget > 2_GiB) {
-                    const u64 old_critical = critical_memory;
                     const u64 margin = (std::min)(budget / 8, 1_GiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
@@ -429,20 +431,38 @@ void TextureCache<P>::TickFrame() {
                     }
                     critical_memory =
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
+                    // The device's budget is not all the room there is: see HostCriticalMemory.
+                    // The usage is the driver's, which still counts images waiting to be freed.
+                    const std::optional<u64> commit_room = Common::GetSystemCommitRoom();
+                    const u64 host_critical =
+                        commit_room
+                            ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *commit_room)
+                            : (std::numeric_limits<u64>::max)();
+                    critical_memory = (std::min)(critical_memory, host_critical);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     ApplyThresholdOverrides(false);
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared after the cap: before it, every check differed from
-                    // the capped value by more than 256 MiB and logged twice a second.
-                    const u64 change = critical_memory > old_critical
-                                           ? critical_memory - old_critical
-                                           : old_critical - critical_memory;
+                    // the capped value by more than 256 MiB and logged twice a second. Compared
+                    // with the last values logged, so a threshold that host memory lowers a
+                    // little at each check is logged too.
+                    const u64 change = critical_memory > logged_critical_memory
+                                           ? critical_memory - logged_critical_memory
+                                           : logged_critical_memory - critical_memory;
                     const bool log = budget_check_frames == 1 || change >= 256_MiB;
                     if (log) {
+                        logged_critical_memory = critical_memory;
                         LogThresholds();
                         LOG_INFO(HW_GPU,
                                  "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
                                  margin >> 20, pressure_margin >> 20, slack_margin >> 20);
+                        if (commit_room) {
+                            LOG_INFO(HW_GPU, "Host memory: {} MiB of commit left, {}",
+                                     *commit_room >> 20,
+                                     critical_memory == host_critical
+                                         ? "which bounds the thresholds"
+                                         : "the device budget bounds the thresholds");
+                        }
                     }
                 }
             }
@@ -1269,6 +1289,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     if (images.empty()) {
         return;
     }
+    const StutterTrace::SiteScope site{StutterTrace::Site::TextureDownload};
     std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
         return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
     });
@@ -2877,6 +2898,7 @@ std::optional<DAddr> TextureCache<P>::ImageCpuAddress(GPUVAddr gpu_addr, size_t 
 template <class P>
 ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                      RelaxedOptions options) {
+    const StutterTrace::SiteScope site{StutterTrace::Site::ImageCreate};
     std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {
         const DAddr fake_addr = ~(1ULL << 40ULL) + virtual_invalid_space;
@@ -3196,6 +3218,25 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             copied_whole = true;
             break;
         }
+    }
+    // The copies from overlaps the GPU wrote can each write a part of it, together all of it:
+    // Mario Kart World renders each layer of its shadow map and colour arrays as a target of its
+    // own, then samples the array, and the upload under those copies took 13-31 ms an array.
+    if (!can_rescale && !copied_whole && new_info.num_samples == 1) {
+        std::vector<u8> written(
+            static_cast<size_t>(new_info.resources.levels * new_info.resources.layers));
+        for (const JoinCopy& copy : join_copies_to_do) {
+            const Image& overlap = slot_images[copy.id];
+            if (copy.is_alias || False(overlap.flags & ImageFlagBits::GpuModified) ||
+                overlap.info.num_samples != 1) {
+                continue;
+            }
+            const SubresourceBase base = new_image.TryFindBase(overlap.gpu_addr).value();
+            MarkSubresourcesWrittenWhole(new_image, overlap,
+                                         MakeShrinkImageCopies(new_info, overlap.info, base, 1, 0),
+                                         written);
+        }
+        copied_whole = std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
     }
     if (overwritten_by_clear()) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
@@ -3908,6 +3949,7 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+    const StutterTrace::SiteScope site{StutterTrace::Site::ImageDelete};
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
