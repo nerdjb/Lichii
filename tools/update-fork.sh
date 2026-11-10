@@ -107,6 +107,14 @@ if [ "$release" = 1 ]; then
             echo "HEAD ${sha:0:7} is already published as $latest_tag."
             exit 0
         fi
+        # A commit that only touches docs or this tooling does not change the binary.
+        if git cat-file -e "$latest_sha^{commit}" 2>/dev/null &&
+            git diff --quiet "$latest_sha" "$sha" -- . \
+                ':(exclude)README.md' ':(exclude)AGENTS.md' ':(exclude)docs' \
+                ':(exclude)tools' ':(exclude).github'; then
+            echo "Only docs/tools changed since $latest_tag; nothing to rebuild."
+            exit 0
+        fi
         echo "No new upstream commits, but HEAD ${sha:0:7} is not published yet; building it."
     fi
 elif [ "$changed" != 1 ] && [ "$force" != 1 ]; then
