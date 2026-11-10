@@ -40,10 +40,11 @@ current upstream `nx2`:
 
 The branch is [nerdjb/Lichii `nx2-amd-framegen`](https://github.com/nerdjb/Lichii/tree/nx2-amd-framegen).
 It tracks upstream `nx2`: `tools/update-fork.sh --release` merges new upstream commits, pushes the
-result, and publishes a fresh PGO build as the next `build-N` release, at most once per day. A
-systemd user timer runs it daily on the machine that owns the fork, because GitHub disables Actions
-here. Downloads are on the [releases page](https://github.com/nerdjb/Lichii/releases), and the
-built-in updater follows them so it will not replace this build with an upstream one.
+result, and publishes a PGO build of the current `HEAD` if it is not released yet. The systemd user
+timer runs the same script with `--auto`, which publishes at most once per day; a manual `--release`
+builds immediately. Downloads are on the
+[releases page](https://github.com/nerdjb/Lichii/releases), and the built-in updater follows them so
+it will not replace this build with an upstream one.
 
 ## Downloads and setup
 

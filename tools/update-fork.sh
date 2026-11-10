@@ -13,12 +13,14 @@ build=0
 release=0
 dry_run=0
 force=0
+auto=0
 
 usage() {
-    echo "usage: $0 [--build] [--release] [--force] [--dry-run]"
+    echo "usage: $0 [--build] [--release] [--auto] [--force] [--dry-run]"
     echo "  --build    rebuild the PGO binary after a merge"
-    echo "  --release  also publish it as the next build-N release (implies --build)"
-    echo "  --force    build and publish even when upstream has not moved"
+    echo "  --release  publish it as the next build-N release (implies --build)"
+    echo "  --auto     with --release, publish at most once per day (used by the timer)"
+    echo "  --force    build and publish even when the code is already published"
     echo "  --dry-run  print what would happen"
 }
 
@@ -26,6 +28,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --build) build=1; shift ;;
         --release) release=1; build=1; shift ;;
+        --auto) auto=1; shift ;;
         --force) force=1; shift ;;
         --dry-run) dry_run=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -77,19 +80,37 @@ fi
 
 run git push origin "HEAD:$branch"
 
-if [ "$build" != 1 ] || { [ "$changed" != 1 ] && [ "$force" != 1 ]; }; then
+if [ "$build" != 1 ]; then
     exit 0
 fi
 
-# One published build per day: upstream often lands dozens of commits in a day, and a release per
-# batch would be noise. The first run of the day ships everything up to that point; later runs only
-# update the source unless --force is given.
-if [ "$release" = 1 ] && [ "$force" != 1 ]; then
-    published=$(gh release list -R "$repo_slug" --limit 1 --json publishedAt --jq '.[0].publishedAt // ""')
-    if [ "${published:0:10}" = "$(date -u +%F)" ]; then
-        echo "A release was already published today ($published); run with --force to publish again."
-        exit 0
+sha=$(git rev-parse HEAD)
+
+if [ "$release" = 1 ]; then
+    # A merge can land without a release: a timer run stopped by the daily guard, or an earlier
+    # run that only pushed the source. Publish whatever HEAD is now, not just what merged this run.
+    latest_tag=$(gh release list -R "$repo_slug" --limit 1 --json tagName --jq '.[0].tagName // ""')
+    if [ -n "$latest_tag" ] && [ "$force" != 1 ]; then
+        latest_sha=$(gh release view "$latest_tag" -R "$repo_slug" \
+            --json targetCommitish --jq '.targetCommitish // ""')
+        if [ "$latest_sha" = "$sha" ]; then
+            echo "HEAD ${sha:0:7} is already published as $latest_tag."
+            exit 0
+        fi
+        echo "Upstream has no newer commits, but HEAD ${sha:0:7} is not published yet; building it."
     fi
+
+    # The timer publishes at most one build per day; a manual --release is an explicit request to
+    # build now, so it skips this check.
+    if [ "$auto" = 1 ] && [ "$force" != 1 ]; then
+        published=$(gh release list -R "$repo_slug" --limit 1 --json publishedAt --jq '.[0].publishedAt // ""')
+        if [ "${published:0:10}" = "$(date -u +%F)" ]; then
+            echo "A release was already published today ($published); leaving the source updated only."
+            exit 0
+        fi
+    fi
+elif [ "$changed" != 1 ] && [ "$force" != 1 ]; then
+    exit 0
 fi
 
 # Continue the build numbering from whichever is higher, this fork or upstream, so the number
@@ -98,7 +119,6 @@ here=$(latest_build_number "$repo_slug")
 there=$(latest_build_number "zortos293/Lichii")
 next=$(( (here > there ? here : there) + 1 ))
 tag="build-$next"
-sha=$(git rev-parse HEAD)
 
 echo "Building $tag from $sha"
 run cmake -S . -B build-pgo "-DLICHII_BUILD_TAG=$tag"
