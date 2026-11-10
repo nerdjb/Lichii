@@ -87,19 +87,6 @@ fi
 sha=$(git rev-parse HEAD)
 
 if [ "$release" = 1 ]; then
-    # A merge can land without a release: a timer run stopped by the daily guard, or an earlier
-    # run that only pushed the source. Publish whatever HEAD is now, not just what merged this run.
-    latest_tag=$(gh release list -R "$repo_slug" --limit 1 --json tagName --jq '.[0].tagName // ""')
-    if [ -n "$latest_tag" ] && [ "$force" != 1 ]; then
-        latest_sha=$(gh release view "$latest_tag" -R "$repo_slug" \
-            --json targetCommitish --jq '.targetCommitish // ""')
-        if [ "$latest_sha" = "$sha" ]; then
-            echo "HEAD ${sha:0:7} is already published as $latest_tag."
-            exit 0
-        fi
-        echo "Upstream has no newer commits, but HEAD ${sha:0:7} is not published yet; building it."
-    fi
-
     # The timer publishes at most one build per day; a manual --release is an explicit request to
     # build now, so it skips this check.
     if [ "$auto" = 1 ] && [ "$force" != 1 ]; then
@@ -108,6 +95,19 @@ if [ "$release" = 1 ]; then
             echo "A release was already published today ($published); leaving the source updated only."
             exit 0
         fi
+    fi
+
+    # A merge can land without a release: a timer run stopped by the daily guard, or an earlier
+    # run that only pushed the source. Publish whatever HEAD is now, not just what merged this run.
+    latest_tag=$(gh release list -R "$repo_slug" --limit 1 --json tagName --jq '.[0].tagName // ""')
+    if [ "$changed" != 1 ] && [ -n "$latest_tag" ] && [ "$force" != 1 ]; then
+        latest_sha=$(gh release view "$latest_tag" -R "$repo_slug" \
+            --json targetCommitish --jq '.targetCommitish // ""')
+        if [ "$latest_sha" = "$sha" ]; then
+            echo "HEAD ${sha:0:7} is already published as $latest_tag."
+            exit 0
+        fi
+        echo "No new upstream commits, but HEAD ${sha:0:7} is not published yet; building it."
     fi
 elif [ "$changed" != 1 ] && [ "$force" != 1 ]; then
     exit 0
