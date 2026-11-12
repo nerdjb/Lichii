@@ -412,6 +412,11 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
     static_cast<void>(device);
     static_cast<void>(current_view);
 
+    if (frame_count == 0) {
+        m_has_history = false;
+        m_flow_valid = false;
+    }
+
     if (!m_layouts_ready) {
         scheduler.Record([this](vk::CommandBuffer cmdbuf) {
             std::vector<VkImageMemoryBarrier> barriers;
