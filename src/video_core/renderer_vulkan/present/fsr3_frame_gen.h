@@ -32,8 +32,8 @@ public:
     void Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
                  VkImageView current_view, u64 frame_count);
 
-    void Generate(const Device& device, Scheduler& scheduler, VkImageView destination_storage_view,
-                  float blend_factor, float flow_scale);
+    void Generate(const Device& device, Scheduler& scheduler, VkImage destination,
+                  VkImageView destination_storage_view, float blend_factor, float flow_scale);
 
     [[nodiscard]] bool IsReady() const {
         return m_initialized && m_has_history;

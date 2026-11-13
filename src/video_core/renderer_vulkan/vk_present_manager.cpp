@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <cmath>
-#include <cstdlib>
 #include <thread>
-#include <vector>
+
 #include "common/display_hdr.h"
-#include "common/logging.h"
+#include "common/dkb_frame_trace.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
+#ifdef _WIN32
+#include "common/windows/timer_resolution.h"
+#endif
 #include "core/frontend/emu_window.h"
 #include "video_core/nx2_profile.h"
 #ifdef HAS_LSFG
@@ -24,6 +24,9 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 
 namespace Vulkan {
 
@@ -35,6 +38,22 @@ constexpr u32 MAX_PRESENT_ATTEMPTS = 3;
 #ifdef HAS_LSFG
 static_assert(MAX_FRAMES_IN_FLIGHT <= LSFG_MAX_TARGETS);
 #endif
+
+// Sleeps until the deadline, without spinning: it may pass by up to a timer tick (about 0.5 ms
+// on Windows), well within a refresh, and the next deadline counts from the actual present.
+void SleepUntil(std::chrono::steady_clock::time_point deadline) {
+    while (true) {
+        const auto left = deadline - std::chrono::steady_clock::now();
+        if (left <= std::chrono::steady_clock::duration::zero()) {
+            return;
+        }
+#ifdef _WIN32
+        Common::Windows::SleepForOneTick();
+#else
+        std::this_thread::sleep_for(left);
+#endif
+    }
+}
 
 bool CanStoreToFrame(const vk::PhysicalDevice& physical_device, VkFormat format) {
 #ifdef HAS_LSFG
@@ -136,7 +155,8 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , swapchain{swapchain_}
     , surface{surface_}
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
-    // Frame generation spaces its frames from the present thread (the render thread can't wait).
+    // Frame generation needs the present thread to space generated frames without stalling the
+    // emulator.
     , use_present_thread{Settings::values.async_presentation.GetValue() ||
                          Settings::values.frame_gen.GetValue()}
 {
@@ -172,16 +192,57 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     }
 
     if (use_present_thread) {
-        present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
+        StartPresentThread();
     }
 }
 
-PresentManager::~PresentManager() = default;
+void PresentManager::StartPresentThread() {
+    use_present_thread = true;
+    present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
+}
+
+void PresentManager::LogPacing(const Frame* frame, std::chrono::steady_clock::duration took,
+                               std::chrono::steady_clock::time_point now) {
+    if (!Settings::values.frame_gen.GetValue()) {
+        return;
+    }
+    const bool generated = frame->present_spacing.count() != 0;
+    ++(generated ? pacing_log.generated : pacing_log.real);
+    pacing_log.spacing += frame->present_spacing;
+    pacing_log.present_time += took;
+    if (pacing_log.since == std::chrono::steady_clock::time_point{}) {
+        pacing_log.since = now;
+    } else if (now - pacing_log.since >= std::chrono::seconds(10)) {
+        const auto ms = [](auto duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        const u64 total = pacing_log.real + pacing_log.generated;
+        LOG_INFO(Render_Vulkan,
+                 "Frame gen pacing (10 s): {} real and {} generated presents, spacing {:.2f} ms "
+                 "after each generated frame, {:.2f} ms average wait and present",
+                 pacing_log.real, pacing_log.generated,
+                 pacing_log.generated ? ms(pacing_log.spacing) / pacing_log.generated : 0.0,
+                 total ? ms(pacing_log.present_time) / total : 0.0);
+        pacing_log = {.since = now};
+    }
+}
+
+PresentManager::~PresentManager() {
+    // FrameGenSuspend uses state only the present thread touches: stop that thread first.
+    if (present_thread.joinable()) {
+        present_thread.request_stop();
+        present_thread.join();
+    }
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::FrameGenSuspend();
+#endif
+}
 
 Frame* PresentManager::GetRenderFrame() {
 
     VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
     // Wait for free presentation frames
+    const auto waiting = std::chrono::steady_clock::now();
     std::unique_lock lock{free_mutex};
     free_cv.wait(lock, [this] { return !free_queue.empty(); });
 
@@ -191,13 +252,24 @@ Frame* PresentManager::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     frame->present_done.Wait();
+    blocked_time.fetch_add((std::chrono::steady_clock::now() - waiting).count(),
+                           std::memory_order_relaxed);
     frame->present_done.Reset();
     frame->color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    frame->present_spacing = {};
+#ifdef EGLANTINE_STREAMLINE
+    frame->frame_gen = false;
+#endif
 
     return frame;
 }
 
 void PresentManager::Present(Frame* frame) {
+    if (!use_present_thread && Settings::values.frame_gen.GetValue()) {
+        // Frame generation was turned on from the status bar while a game runs. Earlier frames
+        // were presented here, so none are in flight.
+        StartPresentThread();
+    }
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
             std::unique_lock lock{queue_mutex};
@@ -371,8 +443,16 @@ void PresentManager::PresentThread(std::stop_token token) {
             // before the queue lock goes out of scope. This way the swapchain
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
-            WaitUntilPresentTime(frame);
+            const bool trace = Common::DkbFrameTrace::Enabled();
+            const auto ready = trace ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+            SleepUntil(next_present);
             CopyToSwapchain(frame);
+            const auto presented = std::chrono::steady_clock::now();
+            next_present = presented + frame->present_spacing;
+            if (trace) {
+                LogPacing(frame, presented - ready, presented);
+            }
 
             // Free the frame for reuse
             std::scoped_lock fl{free_mutex};
@@ -395,6 +475,9 @@ void PresentManager::UpdateHdrMetadata() {
 
 // Returns false after discarding a deferred or incompatible frame; creation exceptions propagate.
 bool PresentManager::RecreateSwapchain(Frame* frame) {
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::FrameGenSuspend();
+#endif
     if (swapchain.Create(*surface, frame->width, frame->height, frame->format,
                          frame->color_space)) {
         SetImageCount();
@@ -460,28 +543,14 @@ void PresentManager::DiscardFrame(Frame* frame) {
     void(device.GetGraphicsQueue().Submit(submit_info, *frame->present_done));
 }
 
-void PresentManager::WaitUntilPresentTime(Frame* frame) {
-    using Clock = std::chrono::steady_clock;
-    const Clock::time_point at = std::exchange(frame->present_at, Clock::time_point{});
-    if (at == Clock::time_point{}) {
-        return;
-    }
-    // Sleep to 1.5 ms before (Windows sleeps in coarse steps), then yield up to it. A time more
-    // than 100 ms away is stale and ignored.
-    const auto now = Clock::now();
-    if (at <= now || at - now > std::chrono::milliseconds{100}) {
-        return;
-    }
-    if (at - now > std::chrono::microseconds{1500}) {
-        std::this_thread::sleep_until(at - std::chrono::microseconds{1500});
-    }
-    while (Clock::now() < at) {
-        std::this_thread::yield();
-    }
-}
-
 void PresentManager::CopyToSwapchain(Frame* frame) {
-    LogPresentTiming();
+#ifdef EGLANTINE_STREAMLINE
+    SCOPE_EXIT {
+        if (frame->frame_gen) {
+            Streamline::FrameGenClosePresent(frame->frame_gen_frame.index);
+        }
+    };
+#endif
     bool requires_recreation = false;
 
     for (u32 attempt = 0; attempt < MAX_PRESENT_ATTEMPTS; ++attempt) {
@@ -693,55 +762,24 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
+#ifdef EGLANTINE_STREAMLINE
+    if (frame->frame_gen) {
+        Streamline::FrameGenBeforePresent({
+            .frame = frame->frame_gen_frame,
+            .guest_rect = frame->guest_rect,
+            .frame_extent = {frame->width, frame->height},
+            .swapchain_extent = extent,
+            .swapchain_format = swapchain.GetImageFormat(),
+            .swapchain_images = static_cast<u32>(swapchain.GetImageCount()),
+        });
+    }
+#endif
     swapchain.Present(render_semaphore);
-}
-
-
-void PresentManager::LogPresentTiming() {
-    // EDEN_NX2_PRESENT_TIMING=1: once a second, how evenly frames reached the swapchain (the
-    // intervals between presents), to tell paced frame generation from bunched frames.
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_PRESENT_TIMING");
-        return value != nullptr && value[0] == '1';
-    }();
-    if (!enabled) {
-        return;
+#ifdef EGLANTINE_STREAMLINE
+    if (frame->frame_gen) {
+        Streamline::FrameGenAfterPresent(frame->frame_gen_frame.index);
     }
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point last{};
-    static Clock::time_point window{};
-    static std::vector<double> intervals;
-    const auto now = Clock::now();
-    if (last != Clock::time_point{}) {
-        intervals.push_back(std::chrono::duration<double, std::milli>(now - last).count());
-    }
-    last = now;
-    if (window == Clock::time_point{}) {
-        window = now;
-    }
-    if (now - window < std::chrono::seconds{1} || intervals.empty()) {
-        return;
-    }
-    double sum = 0;
-    double low = intervals.front();
-    double high = intervals.front();
-    for (const double value : intervals) {
-        sum += value;
-        low = std::min(low, value);
-        high = std::max(high, value);
-    }
-    const double mean = sum / static_cast<double>(intervals.size());
-    double variance = 0;
-    for (const double value : intervals) {
-        variance += (value - mean) * (value - mean);
-    }
-    const double deviation = std::sqrt(variance / static_cast<double>(intervals.size()));
-    LOG_INFO(Render_Vulkan,
-             "Present timing: {} presents, interval mean {:.2f} ms, deviation {:.2f} ms, min "
-             "{:.2f} ms, max {:.2f} ms",
-             intervals.size(), mean, deviation, low, high);
-    intervals.clear();
-    window = now;
+#endif
 }
 
 } // namespace Vulkan

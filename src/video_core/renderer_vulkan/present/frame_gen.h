@@ -4,9 +4,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <optional>
 
 #include "common/common_types.h"
+#include "common/settings_enums.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/present/frame_gen_pacer.h"
 #include "video_core/renderer_vulkan/present/lsfg_chain.h"
@@ -27,16 +29,15 @@ public:
 
     void Process(const Device& device, Frame* frame, VkFormat format, VkExtent2D guest_extent);
 
-    /// Retains resources while invalidating pacing and history across a presentation gap.
-    void Pause();
-
-    [[nodiscard]] size_t WantedGenerations(size_t capacity);
+    /// blocked: the time the renderer waited for the present thread since the last call.
+    [[nodiscard]] size_t WantedGenerations(size_t capacity,
+                                           std::chrono::steady_clock::duration blocked = {});
 
     [[nodiscard]] size_t GeneratedFrameCount() const;
 
-    /// The smoothed time between game frames, in seconds (0 until measured).
+    /// The measured time between real frames in seconds, or 0 while it is unknown.
     [[nodiscard]] f32 FrameInterval() const {
-        return pacer.FrameInterval();
+        return pacer.SmoothedInterval();
     }
 
     void GenerateInto(const Device& device, Frame* destination, size_t generation);
@@ -47,8 +48,14 @@ public:
     }
 
 private:
-    void Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale);
+    void Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale,
+                 Settings::FrameGenType type);
+    /// Updates the status bar state and logs each change with its reason.
+    void SetState(VideoCore::FrameGenState new_state, VkFormat format);
+    /// Logs every 10 s how many frames were generated, when that changes.
+    void LogActivity();
     void DumpDebugImages(u64 count);
+    /// EDEN_NX2_FG_DUMP_DIR=<folder>: <folder>/fgdump.now saves the built-in generator's frames.
     void DumpGeneratedFrame(Frame* destination, size_t generation);
 
     MemoryAllocator& memory_allocator;
@@ -62,6 +69,7 @@ private:
     VkExtent2D peak_guest_extent{};
     VkExtent2D built_extent{};
     VkFormat built_format{VK_FORMAT_UNDEFINED};
+    Settings::FrameGenType built_type{};
     f32 built_flow_scale{};
     u64 frame_count{};
     u64 last_count{};
@@ -74,11 +82,12 @@ private:
     std::atomic<u64> generated_frames{};
     u32 fsr3_dumps_left{}; ///< game frames whose generated frames are still to be dumped
     u32 fsr3_dump_index{};
-    u32 frames_without_storage{};
-    u32 reported{}; ///< REPORTED_* log lines already written since frame generation was turned on
-    static constexpr u32 REPORTED_NO_LSFG = 1U << 0;
-    static constexpr u32 REPORTED_NO_STORAGE = 1U << 1;
-    static constexpr u32 REPORTED_RUNNING = 1U << 2;
+    struct {
+        std::chrono::steady_clock::time_point since{};
+        u64 frames{};
+        u64 generated{};
+        f32 logged_per_frame{-1.0f};
+    } activity;
 };
 
 } // namespace Vulkan

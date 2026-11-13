@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -12,12 +13,17 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/frame_gen_choice.h"
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
-#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#include "video_core/vulkan_common/streamline_frame_gen.h"
+#endif
 
 namespace Vulkan {
 
@@ -26,6 +32,56 @@ namespace {
 constexpr size_t COLOR_CHANNELS = 4;
 constexpr u64 LSFG_REQUIRED_FRAMES = 2;
 constexpr u32 LSFG_RECURRENCE_FRAMES = 2;
+constexpr auto ACTIVITY_LOG_INTERVAL = std::chrono::seconds(10);
+
+[[nodiscard]] std::string ModeText(Settings::FrameGenType active) {
+    const char* type = active == Settings::FrameGenType::Fsr3 ? "FSR3" : "LSFG";
+    const u32 target_rate = Settings::values.frame_gen_target_rate.GetValue();
+    if (target_rate != 0) {
+        return fmt::format("{} up to {}x towards {} FPS", type, Settings::MAX_FRAME_GEN_MULTIPLIER,
+                           target_rate);
+    }
+    return fmt::format("{} {}x", type, Settings::FrameGenMultiplier());
+}
+
+/// Why NVIDIA DLSS Frame Generation isn't this session's frame generator, if it isn't. Streamline
+/// decided that when the game started.
+[[nodiscard]] VideoCore::DlssgBlock DlssgBlocked() {
+#ifdef EGLANTINE_STREAMLINE
+    if (Streamline::FrameGenSession()) {
+        return VideoCore::DlssgBlock::None;
+    }
+    return VideoCore::BlockedDlssg({
+        .streamline = true,
+        .dlss = Settings::values.nvidia_dlss.GetValue(),
+        .program_id = Settings::GetCurrentProgramID(),
+        .loaded = false,
+    });
+#else
+    return VideoCore::DlssgBlock::NoStreamline;
+#endif
+}
+
+[[nodiscard]] std::string DlssgBlockedText(VideoCore::DlssgBlock block) {
+    switch (block) {
+    case VideoCore::DlssgBlock::None:
+        break;
+    case VideoCore::DlssgBlock::NoStreamline:
+        return "this build has no NVIDIA Streamline";
+    case VideoCore::DlssgBlock::DlssOff:
+        return "\"Use NVIDIA DLSS\" is off, and DLSS-G takes its inputs from DLSS";
+    case VideoCore::DlssgBlock::NoGameInputs:
+        return fmt::format("no game motion vectors for {:016X}", Settings::GetCurrentProgramID());
+    case VideoCore::DlssgBlock::NotLoaded:
+#ifdef EGLANTINE_STREAMLINE
+        if (std::string reason = Streamline::FrameGenUnavailableReason(); !reason.empty()) {
+            return reason;
+        }
+#endif
+        return "NVIDIA Streamline did not start";
+    }
+    return {};
+}
 
 [[nodiscard]] f32 ManualFlowScale() {
     return static_cast<f32>(Settings::values.frame_gen_flow_scale.GetValue()) / 100.0f;
@@ -202,64 +258,53 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
                        VkExtent2D guest_extent) {
     generated = false;
 
-    if (!shaders) {
+    const Settings::FrameGenType chosen = Settings::values.frame_gen_type.GetValue();
+    const Settings::FrameGenType type =
+        chosen == Settings::FrameGenType::NvidiaDlssG
+            ? VideoCore::ActiveFrameGenType(chosen, DlssgBlocked())
+            : chosen;
+    if (type == Settings::FrameGenType::Lsfg && !shaders) {
         shaders.emplace(device);
     }
+    unavailable = type == Settings::FrameGenType::Lsfg && !shaders->IsValid();
 
-    // Both settings can change mid-game (status bar button): LSFG is unavailable only while it is
-    // the selected type and Lossless.dll's shaders didn't load.
-    const auto type = Settings::values.frame_gen_type.GetValue();
-    unavailable = type != Settings::FrameGenType::Fsr3 && !shaders->IsValid();
-    if (!Settings::values.frame_gen.GetValue()) {
-        reported = 0;
-        frames_without_storage = 0;
-    } else if (unavailable) {
-        state.store(shaders->IsDeviceSupported() ? VideoCore::FrameGenState::MissingLosslessDll
-                                                 : VideoCore::FrameGenState::UnsupportedGpu,
-                    std::memory_order_relaxed);
-        if ((reported & REPORTED_NO_LSFG) == 0) {
-            reported |= REPORTED_NO_LSFG;
-            LOG_WARNING(Render_Vulkan,
-                        "Frame generation is off: Lossless Scaling (LSFG) is selected but "
-                        "Lossless.dll was not loaded from the lossless folder. Pick the built-in "
-                        "type or add the DLL.");
+    const bool nvidia_frame_gen = type == Settings::FrameGenType::NvidiaDlssG;
+    if (unavailable || !Settings::values.frame_gen.GetValue() || nvidia_frame_gen) {
+        if (!Settings::values.frame_gen.GetValue()) {
+            SetState(VideoCore::FrameGenState::Pending, format);
+        } else if (nvidia_frame_gen) {
+            SetState(VideoCore::FrameGenState::NvidiaFrameGen, format);
         }
-    }
-    if (unavailable || !Settings::values.frame_gen.GetValue()) {
         if (chain || fsr3_chain) {
             scheduler.Finish();
             chain.reset();
             fsr3_chain.reset();
         }
         warm_streak = 0;
+        if (unavailable && Settings::values.frame_gen.GetValue()) {
+            SetState(shaders->IsDeviceSupported() ? VideoCore::FrameGenState::MissingLosslessDll
+                                                  : VideoCore::FrameGenState::UnsupportedGpu,
+                     format);
+        }
         return;
     }
 
     if (!frame->storage_view) {
-        state.store(VideoCore::FrameGenState::UnsupportedSurface, std::memory_order_relaxed);
+        SetState(VideoCore::FrameGenState::UnsupportedSurface, format);
         warm_streak = 0;
-        // A frame gets its storage view at its next present; after that, none means the
-        // display image format can't be written by compute shaders on this GPU.
-        if (++frames_without_storage == 120 && (reported & REPORTED_NO_STORAGE) == 0) {
-            reported |= REPORTED_NO_STORAGE;
-            LOG_WARNING(Render_Vulkan,
-                        "Frame generation can't run: this GPU can't write the display image "
-                        "format {} from compute shaders",
-                        string_VkFormat(format));
-        }
         return;
     }
-    state.store(VideoCore::FrameGenState::Running, std::memory_order_relaxed);
-    frames_without_storage = 0;
+    SetState(VideoCore::FrameGenState::Running, format);
 
     peak_guest_extent.width = (std::max)(peak_guest_extent.width, guest_extent.width);
     peak_guest_extent.height = (std::max)(peak_guest_extent.height, guest_extent.height);
 
     const VkExtent2D extent{.width = frame->width, .height = frame->height};
     const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, extent);
-    if ((!chain && !fsr3_chain) || built_extent.width != extent.width || built_extent.height != extent.height ||
-        built_format != format || built_flow_scale != flow_scale) {
-        Rebuild(device, extent, format, flow_scale);
+    if ((!chain && !fsr3_chain) || built_type != type || built_extent.width != extent.width ||
+        built_extent.height != extent.height || built_format != format ||
+        built_flow_scale != flow_scale) {
+        Rebuild(device, extent, format, flow_scale, type);
     }
 
     const u64 count = frame_count++;
@@ -270,14 +315,9 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     warm_streak = warm ? warm_streak + 1 : 0;
     generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
     generated_frames.fetch_add(GeneratedFrameCount(), std::memory_order_relaxed);
-    if (generated && (reported & REPORTED_RUNNING) == 0) {
-        reported |= REPORTED_RUNNING;
-        LOG_INFO(Render_Vulkan, "Frame generation running: {} generated frame(s) per game frame ({})",
-                 plan.generations,
-                 type == Settings::FrameGenType::Fsr3 ? "built-in optical flow" : "LSFG");
-    }
+    LogActivity();
 
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
+    const bool use_fsr3 = type == Settings::FrameGenType::Fsr3;
 
     if (use_fsr3 && fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
@@ -302,22 +342,95 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     }
 }
 
-void FrameGen::Pause() {
-    pacer.Reset();
-    plan = {};
-    frame_count = 0;
-    last_count = 0;
-    last_generations = 0;
-    warm_streak = 0;
-    generated = false;
+void FrameGen::SetState(VideoCore::FrameGenState new_state, VkFormat format) {
+    if (state.exchange(new_state, std::memory_order_relaxed) == new_state) {
+        return;
+    }
+    switch (new_state) {
+    case VideoCore::FrameGenState::Running:
+        if (Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::NvidiaDlssG) {
+            LOG_INFO(Render_Vulkan,
+                     "Frame generation: NVIDIA DLSS-G unavailable ({}), using {}, presenting {}",
+                     DlssgBlockedText(DlssgBlocked()), ModeText(Settings::FrameGenType::Fsr3),
+                     string_VkFormat(format));
+            break;
+        }
+        LOG_INFO(Render_Vulkan, "Frame generation on: {}, presenting {}",
+                 ModeText(Settings::values.frame_gen_type.GetValue()), string_VkFormat(format));
+        break;
+#ifdef EGLANTINE_STREAMLINE
+    case VideoCore::FrameGenState::NvidiaFrameGen:
+        LOG_INFO(Render_Vulkan,
+                 "Frame generation on: NVIDIA DLSS-G {}x (numFramesToGenerateMax {}), presenting "
+                 "{}",
+                 Streamline::FrameGenGenerated() + 1, Streamline::FrameGenMaxGenerated(),
+                 string_VkFormat(format));
+        break;
+#endif
+    case VideoCore::FrameGenState::UnsupportedSurface:
+        LOG_WARNING(Render_Vulkan,
+                    "Frame generation is on but not running: the GPU can't write {} from a compute "
+                    "shader, so generated frames can't be presented",
+                    string_VkFormat(format));
+        break;
+    case VideoCore::FrameGenState::MissingLosslessDll:
+        LOG_WARNING(Render_Vulkan,
+                    "Frame generation is on but not running: LSFG needs Lossless.dll in the "
+                    "lossless folder of the user directory. FSR3 needs nothing");
+        break;
+    case VideoCore::FrameGenState::UnsupportedGpu:
+        LOG_WARNING(Render_Vulkan,
+                    "Frame generation is on but not running: this GPU lacks Vulkan features LSFG "
+                    "needs. FSR3 may still work");
+        break;
+    default:
+        break;
+    }
+    activity = {};
 }
 
-size_t FrameGen::WantedGenerations(size_t capacity) {
+void FrameGen::LogActivity() {
+    const auto now = std::chrono::steady_clock::now();
+    ++activity.frames;
+    activity.generated += GeneratedFrameCount();
+    if (activity.since == std::chrono::steady_clock::time_point{}) {
+        activity.since = now;
+        return;
+    }
+    if (now - activity.since < ACTIVITY_LOG_INTERVAL) {
+        return;
+    }
+    const f32 per_frame =
+        std::round(10.0f * static_cast<f32>(activity.generated) / static_cast<f32>(activity.frames)) /
+        10.0f;
+    if (per_frame != activity.logged_per_frame) {
+        const f32 seconds = std::chrono::duration<f32>(now - activity.since).count();
+        if (activity.generated == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Frame generation ({}) idle: {:.0f} game FPS, no frames generated. It waits "
+                     "while the game is below 10 FPS, after hitches and once the target is met",
+                     ModeText(built_type), static_cast<f32>(activity.frames) / seconds);
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "Frame generation ({}) generating: {:.0f} game FPS + {:.0f} generated, {:.1f} "
+                     "per game frame",
+                     ModeText(built_type), static_cast<f32>(activity.frames) / seconds,
+                     static_cast<f32>(activity.generated) / seconds, per_frame);
+        }
+        activity.logged_per_frame = per_frame;
+    }
+    activity.since = now;
+    activity.frames = 0;
+    activity.generated = 0;
+}
+
+size_t FrameGen::WantedGenerations(size_t capacity,
+                                   std::chrono::steady_clock::duration blocked) {
     if (unavailable) {
         plan = {};
         return 0;
     }
-    plan = pacer.Plan(capacity);
+    plan = pacer.Plan(capacity, blocked);
     return plan.generations;
 }
 
@@ -326,14 +439,15 @@ size_t FrameGen::GeneratedFrameCount() const {
 }
 
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
+    const bool use_fsr3 = built_type == Settings::FrameGenType::Fsr3;
 
     if (use_fsr3 && fsr3_chain) {
         const f32 blend = static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
         const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, built_extent);
 
         scheduler.RequestOutsideRenderPassOperationContext();
-        fsr3_chain->Generate(device, scheduler, *destination->storage_view, blend, flow_scale);
+        fsr3_chain->Generate(device, scheduler, *destination->image, *destination->storage_view,
+                             blend, flow_scale);
         DumpGeneratedFrame(destination, generation);
     } else if (chain) {
         chain->SetTarget(device, last_generations, generation, destination->index,
@@ -351,14 +465,16 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
     }
 }
 
-void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale) {
+void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale,
+                       Settings::FrameGenType type) {
     scheduler.Finish();
     chain.reset();
     fsr3_chain.reset();
 
     built_flow_scale = flow_scale;
+    built_type = type;
 
-    if (Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3) {
+    if (built_type == Settings::FrameGenType::Fsr3) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
         chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);
@@ -368,49 +484,6 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
     frame_count = 0;
     warm_streak = 0;
     generated = false;
-}
-
-// Debug: with EDEN_NX2_FG_DUMP_DIR=<folder>, creating <folder>/fgdump.now saves the built-in frame
-// generation's frames for the next 6 game frames there as PPM images: for each, the older game
-// frame (a), the generated frames (b, in order) and the newer game frame (c).
-void FrameGen::DumpGeneratedFrame(Frame* destination, size_t generation) {
-    static const char* const dump_dir = std::getenv("EDEN_NX2_FG_DUMP_DIR");
-    if (dump_dir == nullptr || !fsr3_chain) {
-        return;
-    }
-    const std::filesystem::path directory{dump_dir};
-    if (generation == 0 && fsr3_dumps_left == 0) {
-        std::error_code ec;
-        if (std::filesystem::remove(directory / "fgdump.now", ec)) {
-            fsr3_dumps_left = 6;
-        }
-    }
-    if (fsr3_dumps_left == 0) {
-        return;
-    }
-    const VkExtent2D extent{.width = destination->width, .height = destination->height};
-    const VkDeviceSize size = static_cast<VkDeviceSize>(extent.width) * extent.height * COLOR_CHANNELS;
-    const auto dump = [&](const std::string& name, VkImage image) {
-        vk::Buffer buffer = CreateWrappedBuffer(memory_allocator, size, MemoryUsage::Download);
-        scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([image, dst = *buffer, extent](vk::CommandBuffer cmdbuf) {
-            DownloadColorImage(cmdbuf, image, dst,
-                               VkExtent3D{.width = extent.width, .height = extent.height, .depth = 1});
-        });
-        scheduler.Finish();
-        buffer.Invalidate();
-        WriteColorPpm(directory / (name + ".ppm"), extent, buffer.Mapped(), IsBlueFirst(built_format));
-    };
-    const std::string prefix = fmt::format("fg{:03}_", fsr3_dump_index);
-    if (generation == 0) {
-        dump(prefix + "a", fsr3_chain->HistoryImage());
-        dump(prefix + "c", fsr3_chain->CurrentImage());
-    }
-    dump(prefix + "b" + std::to_string(generation), *destination->image);
-    if (generation + 1 >= last_generations) {
-        --fsr3_dumps_left;
-        ++fsr3_dump_index;
-    }
 }
 
 void FrameGen::DumpDebugImages(u64 count) {
@@ -471,6 +544,53 @@ void FrameGen::DumpDebugImages(u64 count) {
     dump("gamma6", chain->GammaOutput(LSFG_MIP_LEVELS - 1));
     dump("delta2_out1", chain->DeltaOutput1(LSFG_DELTA_INSTANCES - 1));
     dump("delta2_out2", chain->DeltaOutput2(LSFG_DELTA_INSTANCES - 1));
+}
+
+// EDEN_NX2_FG_DUMP_DIR=<folder>: creating <folder>/fgdump.now saves the built-in generator's
+// frames for the next 6 game frames as PPM images: for each, the older game frame (a), the
+// generated frames (b, in order) and the newer game frame (c).
+void FrameGen::DumpGeneratedFrame(Frame* destination, size_t generation) {
+    static const char* const dump_dir = std::getenv("EDEN_NX2_FG_DUMP_DIR");
+    if (dump_dir == nullptr || !fsr3_chain) {
+        return;
+    }
+    const std::filesystem::path directory{dump_dir};
+    if (generation == 0 && fsr3_dumps_left == 0) {
+        std::error_code ec;
+        if (std::filesystem::remove(directory / "fgdump.now", ec)) {
+            fsr3_dumps_left = 6;
+        }
+    }
+    if (fsr3_dumps_left == 0) {
+        return;
+    }
+    const VkExtent2D extent{.width = destination->width, .height = destination->height};
+    const VkDeviceSize size =
+        static_cast<VkDeviceSize>(extent.width) * extent.height * COLOR_CHANNELS;
+    const auto dump = [&](const std::string& name, VkImage image) {
+        vk::Buffer buffer = CreateWrappedBuffer(memory_allocator, size, MemoryUsage::Download);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([image, dst = *buffer, extent](vk::CommandBuffer cmdbuf) {
+            DownloadColorImage(
+                cmdbuf, image, dst,
+                VkExtent3D{.width = extent.width, .height = extent.height, .depth = 1});
+        });
+        scheduler.Finish();
+        buffer.Invalidate();
+        WriteColorPpm(directory / (name + ".ppm"), extent, buffer.Mapped(),
+                      IsBlueFirst(built_format));
+    };
+
+    const std::string prefix = fmt::format("fg{:03}_", fsr3_dump_index);
+    if (generation == 0) {
+        dump(prefix + "a", fsr3_chain->HistoryImage());
+        dump(prefix + "c", fsr3_chain->CurrentImage());
+    }
+    dump(prefix + "b" + std::to_string(generation), *destination->image);
+    if (generation + 1 >= last_generations) {
+        --fsr3_dumps_left;
+        ++fsr3_dump_index;
+    }
 }
 
 } // namespace Vulkan

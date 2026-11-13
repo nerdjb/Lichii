@@ -521,9 +521,10 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
     m_flow_valid = true;
 }
 
-void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler,
+void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler, VkImage destination,
                             VkImageView destination_storage_view, float blend_factor,
                             float flow_scale) {
+    static_cast<void>(destination);
     static_cast<void>(flow_scale);
     if (!m_has_history || !m_flow_valid) {
         return;
