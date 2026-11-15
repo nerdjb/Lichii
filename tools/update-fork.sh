@@ -132,13 +132,30 @@ echo "Building $tag from $sha"
 run cmake -S . -B build-pgo "-DLICHII_BUILD_TAG=$tag"
 run cmake --build build-pgo --parallel "${LICHII_BUILD_JOBS:-12}"
 
+# fsr4-vk, the community Vulkan port of FSR 4 the x86-64 packages ship (as in upstream's workflow).
+# The work and output directories persist, so a release that does not change the script reuses the
+# previous build.
+if [ "$(uname -m)" = x86_64 ]; then
+    echo "Building fsr4-vk"
+    run bash tools/fsr4-vk/build.sh build-pgo/fsr4-vk-work build-pgo/fsr4-vk
+fi
+
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage/bin"
-cp build-pgo/bin/lichii build-pgo/bin/eden-cli build-pgo/bin/nx2_switches.txt "$stage/bin/"
-strip "$stage/bin/lichii" "$stage/bin/eden-cli"
-run tar -czf "$stage/lichii-linux-x86_64-pgo.tar.gz" -C "$stage/bin" \
-    lichii eden-cli nx2_switches.txt
+mkdir -p "$stage/lichii/usr/bin"
+cp build-pgo/bin/lichii build-pgo/bin/eden-cli build-pgo/bin/nx2_switches.txt \
+    "$stage/lichii/usr/bin/"
+strip "$stage/lichii/usr/bin/lichii" "$stage/lichii/usr/bin/eden-cli"
+# The emulator loads fsr4-vk from <exe dir>/../lib (FfxRuntime::PortLibrary), which is usr/lib for
+# the usr/bin layout the packages use.
+if [ -f build-pgo/fsr4-vk/amd_fidelityfx_upscaler_vk.so ]; then
+    mkdir -p "$stage/lichii/usr/lib" "$stage/lichii/usr/share/licenses"
+    cp build-pgo/fsr4-vk/amd_fidelityfx_upscaler_vk.so "$stage/lichii/usr/lib/"
+    cp -r build-pgo/fsr4-vk/licenses/fsr4-vk "$stage/lichii/usr/share/licenses/"
+fi
+ln -s usr/bin/lichii "$stage/lichii/lichii"
+ln -s usr/bin/eden-cli "$stage/lichii/eden-cli"
+run tar -czf "$stage/lichii-linux-x86_64-pgo.tar.gz" -C "$stage" lichii
 
 if [ "$release" != 1 ]; then
     echo "Built $tag; leaving it unpublished (no --release)."
@@ -151,5 +168,6 @@ run gh release create "$tag" "$stage/lichii-linux-x86_64-pgo.tar.gz" -R "$repo_s
     --notes "Lichii \`nx2\` with AMD frame generation, built from \`$sha\` (upstream \`$(git rev-parse --short upstream/nx2)\`).
 
 - Large-motion optical flow in the built-in generator, paced generated frames, frame-gen status logging
-- Linux x86_64 PGO build (clang + \`eglantine.profdata\`); extract and run \`lichii\`
+- FSR 4 upscaling via fsr4-vk on x86-64 (\`usr/lib/amd_fidelityfx_upscaler_vk.so\`, licences in \`usr/share/licenses/fsr4-vk\`); enable it in Graphics → AMD FSR 4
+- Linux x86_64 PGO build (clang + \`eglantine.profdata\`); extract and run \`lichii/lichii\`
 - Enable in Graphics → Enable Frame Generation, type Optical Flow Interpolation (built-in)"
